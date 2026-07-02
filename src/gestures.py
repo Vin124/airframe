@@ -31,10 +31,31 @@ _MIN_CURLED_FINGERS_FOR_GRAB = 3
 
 # Pinch thresholds, normalized Euclidean distance (x, y only -- z is noisy
 # depth from MediaPipe and not reliable enough to include here).
-# Hysteresis: entering pinch requires getting close (tight threshold);
-# staying pinched tolerates drifting a bit farther out before releasing.
+#
+# Hysteresis: entering pinch requires getting close (tight ENTER threshold);
+# once pinching, fingers can drift a bit farther apart (looser EXIT
+# threshold) before it releases. That gap is what stops rapid PINCH/OPEN
+# flicker when your fingers hover right at the boundary.
+#
+# HOW TO TUNE (edit only the two numbers below):
+#   - Pinch triggers too EARLY (fires before your fingers actually touch):
+#     lower PINCH_ENTER_THRESHOLD.
+#   - Pinch triggers too LATE (you have to press fingers hard together
+#     before it registers): raise PINCH_ENTER_THRESHOLD.
+#   - Gesture FLICKERS between PINCH and OPEN while held steady: widen the
+#     enter/exit gap -- raise PINCH_EXIT_THRESHOLD and/or lower
+#     PINCH_ENTER_THRESHOLD. A wider gap absorbs small hand tremor near the
+#     boundary instead of it crossing back over a single threshold.
+#   - Pinch releases too EAGERLY on small movement while held: raise
+#     PINCH_EXIT_THRESHOLD so it tolerates more drift before letting go.
+#   - Always keep PINCH_EXIT_THRESHOLD > PINCH_ENTER_THRESHOLD; if they're
+#     equal (or inverted) hysteresis has no effect and flicker comes back.
+#   - These are normalized distances (fraction of the frame, not pixels), so
+#     they scale with hand distance from the camera automatically -- tune at
+#     your typical demo distance from the webcam.
+#
 # Tuned by eye against typical index-thumb spacing at arm's length from a
-# webcam; adjust if PINCH triggers too early/late for your camera distance.
+# webcam.
 PINCH_ENTER_THRESHOLD = 0.05
 PINCH_EXIT_THRESHOLD = 0.07
 
