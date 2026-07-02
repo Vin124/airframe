@@ -9,6 +9,8 @@ from typing import List, Sequence, Tuple
 
 import cv2
 
+from src.gestures import GestureState
+
 # Standard MediaPipe 21-landmark hand topology, as (start, end) index pairs.
 # Landmark map: 0 = wrist; thumb 1-4; index 5-8; middle 9-12; ring 13-16;
 # pinky 17-20. Defined here as a module constant because mediapipe's
@@ -32,6 +34,19 @@ _LANDMARK_COLOR = (0, 0, 255)      # red dots (BGR)
 _CONNECTION_COLOR = (0, 255, 0)    # green lines (BGR)
 _LANDMARK_RADIUS = 4
 _CONNECTION_THICKNESS = 2
+
+# Gesture debug overlay (skeleton mode only).
+_GESTURE_TEXT_COLOR = (255, 255, 255)   # white (BGR)
+_GESTURE_TEXT_ORIGIN = (10, 30)         # top-left, in pixels
+_GESTURE_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_GESTURE_FONT_SCALE = 1.0
+_GESTURE_TEXT_THICKNESS = 2
+_PINCH_POINT_COLOR = (0, 255, 255)      # yellow (BGR)
+_PINCH_POINT_RADIUS = 8
+
+_LABEL_GRAB = "GRAB"
+_LABEL_PINCH = "PINCH"
+_LABEL_OPEN = "OPEN"
 
 
 def normalized_to_pixel(x: float, y: float, width: int, height: int) -> Tuple[int, int]:
@@ -62,5 +77,39 @@ def draw_skeleton(frame, hands: Sequence[List[Tuple[float, float, float]]]):
 
         for point in points:
             cv2.circle(frame, point, _LANDMARK_RADIUS, _LANDMARK_COLOR, thickness=-1)
+
+    return frame
+
+
+def _gesture_label(gesture: GestureState) -> str:
+    """Pick the debug label: GRAB takes priority over PINCH over OPEN."""
+    if gesture.is_grab:
+        return _LABEL_GRAB
+    if gesture.is_pinching:
+        return _LABEL_PINCH
+    return _LABEL_OPEN
+
+
+def draw_gesture_debug(frame, gesture: GestureState):
+    """Draw the current gesture label and a dot at the pinch point, in place.
+
+    ``gesture.pinch_point`` is normalized (0-1); converted to pixels here,
+    same as landmark drawing. Returns the same frame for convenient chaining.
+    """
+    height, width = frame.shape[:2]
+
+    cv2.putText(
+        frame,
+        _gesture_label(gesture),
+        _GESTURE_TEXT_ORIGIN,
+        _GESTURE_FONT,
+        _GESTURE_FONT_SCALE,
+        _GESTURE_TEXT_COLOR,
+        _GESTURE_TEXT_THICKNESS,
+    )
+
+    pinch_x, pinch_y = gesture.pinch_point
+    point = normalized_to_pixel(pinch_x, pinch_y, width, height)
+    cv2.circle(frame, point, _PINCH_POINT_RADIUS, _PINCH_POINT_COLOR, thickness=-1)
 
     return frame
