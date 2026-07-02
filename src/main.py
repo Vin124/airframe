@@ -1,7 +1,8 @@
 """Entry point: argument parsing, mode dispatch, and the main capture loop.
 
-Phase 0: no hand tracking yet. Just opens the webcam, mirrors the feed,
-shows it in a window, prints FPS, and quits on 'q'.
+Skeleton mode runs live MediaPipe hand tracking and draws a 21-point skeleton
+over the mirrored feed. Image mode is still a passthrough (filled in Phase 3).
+Both modes mirror the feed, show it in a window, print FPS, and quit on 'q'.
 """
 
 import argparse
@@ -11,6 +12,8 @@ import cv2
 
 from src.camera import Camera, CameraError
 from src.fps import FpsCounter
+from src.hand_tracker import HandTracker, HandTrackerError
+from src.skeleton import draw_skeleton
 
 WINDOW_NAME = "handy"
 QUIT_KEY = "q"
@@ -37,17 +40,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
-def process_frame(frame, args: argparse.Namespace):
-    """Per-mode frame-processing hook.
+def process_frame(frame, args: argparse.Namespace, tracker):
+    """Per-mode frame-processing hook, run on the already-mirrored frame.
 
-    Phase 0: passthrough only. Hand tracking / skeleton drawing (Phase 1) and
-    image overlay (Phase 3) slot in here, branching on args.mode.
+    Skeleton mode detects hands and draws the skeleton in place. Image mode is
+    a passthrough for now (image overlay lands in Phase 3). ``tracker`` is a
+    HandTracker in skeleton mode, else None.
     """
+    if args.mode == MODE_SKELETON and tracker is not None:
+        hands = tracker.detect(frame)
+        draw_skeleton(frame, hands)
     return frame
 
 
 def run(args: argparse.Namespace) -> None:
     """Open the webcam and run the capture/display/quit loop until 'q' or failure."""
+    tracker = None
+    if args.mode == MODE_SKELETON:
+        try:
+            tracker = HandTracker()
+        except HandTrackerError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     try:
         with Camera() as camera:
             fps_counter = FpsCounter()
@@ -57,8 +72,9 @@ def run(args: argparse.Namespace) -> None:
                     print("Warning: failed to read frame from webcam.", file=sys.stderr)
                     break
 
+                # Mirror first, then detect, so drawn landmarks align with the view.
                 frame = cv2.flip(frame, MIRROR_FLIP_CODE)
-                frame = process_frame(frame, args)
+                frame = process_frame(frame, args, tracker)
 
                 cv2.imshow(WINDOW_NAME, frame)
 
@@ -73,6 +89,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
+        if tracker is not None:
+            tracker.close()
         cv2.destroyAllWindows()
 
 
