@@ -10,6 +10,7 @@ from typing import List, Sequence, Tuple
 import cv2
 
 from src.gestures import GestureState
+from src.hud import gesture_label as hud_gesture_label
 
 # Standard MediaPipe 21-landmark hand topology, as (start, end) index pairs.
 # Landmark map: 0 = wrist; thumb 1-4; index 5-8; middle 9-12; ring 13-16;
@@ -44,11 +45,6 @@ _GESTURE_TEXT_THICKNESS = 2
 _PINCH_POINT_COLOR = (0, 255, 255)      # yellow (BGR)
 _PINCH_POINT_RADIUS = 8
 
-_LABEL_GRAB = "GRAB"
-_LABEL_PINCH = "PINCH"
-_LABEL_OPEN = "OPEN"
-
-
 def normalized_to_pixel(x: float, y: float, width: int, height: int) -> Tuple[int, int]:
     """Convert a normalized ``(x, y)`` in [0, 1] to integer pixel coordinates."""
     return int(round(x * width)), int(round(y * height))
@@ -82,12 +78,14 @@ def draw_skeleton(frame, hands: Sequence[List[Tuple[float, float, float]]]):
 
 
 def _gesture_label(gesture: GestureState) -> str:
-    """Pick the debug label: GRAB takes priority over PINCH over OPEN."""
-    if gesture.is_grab:
-        return _LABEL_GRAB
-    if gesture.is_pinching:
-        return _LABEL_PINCH
-    return _LABEL_OPEN
+    """Pick the debug label, delegating to hud's single label-priority rule.
+
+    ``hand_present=True`` because this debug overlay is only drawn on frames
+    where a hand was detected (see main.py).
+    """
+    return hud_gesture_label(
+        is_grab=gesture.is_grab, is_pinching=gesture.is_pinching, hand_present=True
+    )
 
 
 def draw_gesture_debug(frame, gesture: GestureState):
