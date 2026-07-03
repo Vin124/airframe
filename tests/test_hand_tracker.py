@@ -19,6 +19,7 @@ from src.hand_tracker import (
     ensure_model,
     landmarks_to_hands,
 )
+from src.tuning import TrackerConfidence
 
 
 def _fake_landmark(x, y, z):
@@ -176,3 +177,38 @@ def test_create_landmarker_cpu_failure_is_fatal():
     record = []
     with pytest.raises(HandTrackerError):
         create_landmarker(_factory(record, fail_all=True), _MODEL, num_hands=1, gpu=False)
+
+
+# --------------------------------------------------------------------------- #
+# Startup-only confidence plumbing into HandLandmarkerOptions
+# --------------------------------------------------------------------------- #
+
+def test_create_landmarker_passes_confidence_into_options():
+    captured = {}
+
+    def factory(options):
+        captured["detection"] = options.min_hand_detection_confidence
+        captured["presence"] = options.min_hand_presence_confidence
+        captured["tracking"] = options.min_tracking_confidence
+        return options.base_options.delegate
+
+    create_landmarker(
+        factory, _MODEL, num_hands=1, gpu=False,
+        confidence=TrackerConfidence(detection=0.6, presence=0.7, tracking=0.8),
+    )
+    assert (captured["detection"], captured["presence"], captured["tracking"]) == (0.6, 0.7, 0.8)
+
+
+def test_create_landmarker_defaults_confidence_to_mediapipe_half():
+    captured = {}
+
+    def factory(options):
+        captured["values"] = (
+            options.min_hand_detection_confidence,
+            options.min_hand_presence_confidence,
+            options.min_tracking_confidence,
+        )
+        return options.base_options.delegate
+
+    create_landmarker(factory, _MODEL, num_hands=1, gpu=False)
+    assert captured["values"] == (0.5, 0.5, 0.5)

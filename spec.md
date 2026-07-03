@@ -55,13 +55,15 @@ shacam-win/
 └── src/
     ├── main.py             # entry point, arg parsing, mode dispatch, PipelineRuntime (main loop), thread wiring; re-exports layers/launch helpers for the test surface
     ├── layers.py           # scene/source-layer transitions (build/add/remove/fit) + mode/source/layer-key vocabulary; camera-free + unit-testable
-    ├── launch.py           # launch-time settings glue: panel prefill, config <-> args, panel build (lazy Tk import)
+    ├── launch.py           # launch glue: CLI parsing, panel prefill, config <-> args, panel build (lazy Tk import)
     ├── camera.py           # low-level webcam open/read/release wrapper
     ├── hand_tracker.py     # MediaPipe wrapper -> normalized 21-landmark list; --gpu delegate + CPU fallback
     ├── tracking.py         # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
     ├── timing.py           # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
     ├── skeleton.py         # draw landmarks + connections (debug overlay)
-    ├── gestures.py         # pinch / grab detection from landmarks
+    ├── gestures.py         # pinch / grab detection from landmarks; per-instance, live-tunable enter/exit thresholds
+    ├── tuning.py           # dependency-light GestureTuning + TrackerConfidence snapshots + clamp_tuning (the one hysteresis-gap boundary shared by panel + config)
+    ├── window_list.py      # list_window_titles() via ctypes EnumWindows for the panel dropdown; injectable + failure-safe ([])
     ├── hud.py              # heads-up display text + strip (incl. per-stage timing line)
     ├── fps.py              # frame-rate counter (main-loop rate)
     ├── panel.py            # Tkinter control panel + PanelActions controller (Phase 10)
@@ -115,6 +117,7 @@ python -m src.main --mode image --image assets/test.png
 python -m src.main --mode image --source window --window-title "Notepad"  # live window overlay
 python -m src.main --mode image --source screen --monitor-index 1         # live monitor overlay (1-based)
 python -m src.main --mode skeleton --gpu                                   # request GPU delegate (CPU fallback)
+python -m src.main --mode skeleton --min-detection-confidence 0.7          # startup-only MediaPipe confidence (also --min-presence/--min-tracking)
 ```
 `--gpu` requests MediaPipe's built-in GPU delegate for the hand model and falls
 back to CPU with a one-line notice when it's unavailable (the expected case for
@@ -129,19 +132,41 @@ nice-to-have, not required.)
 ### Control panel + config (Phase 10)
 By default a small Tkinter control panel opens next to the preview so the app is
 usable without memorizing hotkeys: choose a source (image via a file picker,
-window by title, monitor by index) and add it as a layer, toggle the virtual
-cam, reset the scene (removes all layers, closing each source), and read a live
-FPS value. The panel drives the same `PipelineRuntime` methods the hotkeys use
-(it is pumped once per main-loop tick on the main thread — Tkinter is not
-thread-safe — so button callbacks run inline between frames and the main loop
-stays the single writer of scene/interaction). Pass `--no-panel` to run
-hotkey-only (headless / keyboard-only). The last source choice, image path,
-window title, monitor index, and virtual-cam state persist to
-`handy_config.json` (repo root, git-ignored) on exit and pre-fill the panel on
-start. Startup precedence is **CLI flags > config > built-in defaults**; a
-missing or corrupt config falls back to defaults with a stderr notice, never a
-crash. See `src/config.py` (pure load/save/merge) and `src/panel.py`
-(controller + Tk view).
+window by an editable title dropdown, monitor by index) and add it as a layer,
+toggle the virtual cam, reset the scene (removes all layers, closing each
+source), retune pinch detection with two live sliders (pinch ENTER / EXIT
+threshold), and read a live FPS value. The window-title dropdown re-enumerates
+the open top-level windows each time it opens (`src/window_list.py`, ctypes
+`EnumWindows` — no new dependency; failure-safe, filtered to non-empty titles
+excluding the app's own windows) and stays editable so a custom substring still
+works. The panel drives the same `PipelineRuntime` methods the hotkeys use (it is
+pumped once per main-loop tick on the main thread — Tkinter is not thread-safe —
+so button/slider callbacks run inline between frames and the main loop stays the
+single writer of scene/interaction). Pass `--no-panel` to run hotkey-only
+(headless / keyboard-only).
+
+The last source choice, image path, window title, monitor index, virtual-cam
+state, pinch thresholds (`pinch_enter` / `pinch_exit`), and the three MediaPipe
+min-confidence knobs persist to `handy_config.json` (repo root, git-ignored) on
+exit and pre-fill the panel/tracker on start. Startup precedence is **CLI flags >
+config > built-in defaults**; a missing or corrupt config falls back to defaults
+with a stderr notice, never a crash. See `src/config.py` (pure load/save/merge)
+and `src/panel.py` (controller + Tk view).
+
+Live pinch tuning flows main-thread → tracking-thread as a frozen `GestureTuning`
+published by one atomic reference store (`TrackingWorker.set_tuning`); the
+tracking thread swaps it onto the `GestureDetector`s it owns, so the main thread
+never touches detector internals. `src/tuning.py`'s `clamp_tuning` is the single
+boundary that enforces the hysteresis invariant `exit > enter` (a minimum gap) on
+both the slider path and config load, so an inverted/equal pair can never
+reintroduce pinch-label flicker.
+
+The MediaPipe min-confidence params (`--min-detection-confidence`,
+`--min-presence-confidence`, `--min-tracking-confidence`; defaults 0.5) are
+**startup-only**: they bake into the `HandLandmarker` options, so a change needs
+a tracker re-init. They are therefore CLI/config flags, not live sliders (unlike
+the pinch thresholds), resolved from the resolved config into the tracker at
+construction.
 
 ## Conventions
 - **Keep every increment runnable.** After each subplan the app must launch and show *something* on the webcam. No half-wired states.

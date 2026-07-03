@@ -49,6 +49,7 @@ from src.scene import Layer, Scene, Transform
 from src.sinks import SinkError
 from src.sources import ImageSource, SourceError
 from src.sources.base import Size, Source
+from src.tuning import GestureTuning, TrackerConfidence, clamp_tuning
 
 
 class _FakeSource(Source):
@@ -125,7 +126,7 @@ def test_init_mode_passes_gpu_flag_to_tracker(monkeypatch):
     created = {}
 
     class _FakeTracker:
-        def __init__(self, num_hands=1, gpu=False):
+        def __init__(self, num_hands=1, gpu=False, confidence=None):
             created["num_hands"] = num_hands
             created["gpu"] = gpu
 
@@ -138,12 +139,32 @@ def test_init_mode_defaults_gpu_false(monkeypatch):
     created = {}
 
     class _FakeTracker:
-        def __init__(self, num_hands=1, gpu=False):
+        def __init__(self, num_hands=1, gpu=False, confidence=None):
             created["gpu"] = gpu
 
     monkeypatch.setattr(src.main, "HandTracker", _FakeTracker)
     _init_mode(parse_args(["--mode", "skeleton"]))
     assert created["gpu"] is False
+
+
+def test_init_mode_threads_tuning_and_confidence(monkeypatch):
+    created = {}
+
+    class _FakeTracker:
+        def __init__(self, num_hands=1, gpu=False, confidence=None):
+            created["confidence"] = confidence
+
+    monkeypatch.setattr(src.main, "HandTracker", _FakeTracker)
+    tuning = GestureTuning(0.03, 0.06)
+    confidence = TrackerConfidence(0.6, 0.7, 0.8)
+    tracker, detectors, scene, interaction = _init_mode(
+        parse_args(["--mode", "skeleton"]), tuning, confidence
+    )
+    # Detectors built WITH the resolved tuning (applies from frame one).
+    assert detectors[0]._enter_threshold == 0.03
+    assert detectors[0]._exit_threshold == 0.06
+    # Confidence handed to the tracker.
+    assert created["confidence"] is confidence
 
 
 # --------------------------------------------------------------------------- #
@@ -792,6 +813,78 @@ def test_config_from_args_builds_dict():
 
 
 # --------------------------------------------------------------------------- #
+# Startup-only confidence flags: parsing, validation, prefill precedence
+# --------------------------------------------------------------------------- #
+
+def test_confidence_flags_default_to_half():
+    args = parse_args(["--mode", "skeleton"])
+    assert args.min_detection_confidence == 0.5
+    assert args.min_presence_confidence == 0.5
+    assert args.min_tracking_confidence == 0.5
+
+
+def test_confidence_flags_parse_values():
+    args = parse_args(
+        [
+            "--mode", "skeleton",
+            "--min-detection-confidence", "0.7",
+            "--min-presence-confidence", "0.6",
+            "--min-tracking-confidence", "0.8",
+        ]
+    )
+    assert args.min_detection_confidence == 0.7
+    assert args.min_presence_confidence == 0.6
+    assert args.min_tracking_confidence == 0.8
+
+
+def test_confidence_flag_out_of_range_is_rejected():
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "skeleton", "--min-detection-confidence", "1.5"])
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "skeleton", "--min-tracking-confidence", "-0.1"])
+
+
+_CFG_WITH_NEW_KEYS = {
+    **_FULL_CFG,
+    "pinch_enter": 0.03,
+    "pinch_exit": 0.11,
+    "min_detection_confidence": 0.6,
+    "min_presence_confidence": 0.65,
+    "min_tracking_confidence": 0.7,
+}
+
+
+def test_resolve_prefill_pinch_from_config_no_cli():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, _CFG_WITH_NEW_KEYS)
+    assert pf["pinch_enter"] == 0.03  # config value (no CLI flag exists)
+    assert pf["pinch_exit"] == 0.11
+
+
+def test_resolve_prefill_pinch_defaults_when_absent():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, _FULL_CFG)  # no pinch keys
+    assert pf["pinch_enter"] == 0.05
+    assert pf["pinch_exit"] == 0.07
+
+
+def test_resolve_prefill_confidence_cli_nondefault_wins():
+    args = parse_args(["--mode", "skeleton", "--min-detection-confidence", "0.9"])
+    pf = resolve_panel_prefill(args, _CFG_WITH_NEW_KEYS)
+    assert pf["min_detection_confidence"] == 0.9  # explicit CLI beats config
+    assert pf["min_presence_confidence"] == 0.65  # CLI at default -> config
+    assert pf["min_tracking_confidence"] == 0.7
+
+
+def test_resolve_prefill_confidence_defaults_when_cli_default_and_config_absent():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, _FULL_CFG)  # no confidence keys
+    assert pf["min_detection_confidence"] == 0.5
+    assert pf["min_presence_confidence"] == 0.5
+    assert pf["min_tracking_confidence"] == 0.5
+
+
+# --------------------------------------------------------------------------- #
 # Phase 10: PipelineRuntime panel-drive methods (add / reset / toggle / pump)
 # --------------------------------------------------------------------------- #
 
@@ -822,6 +915,46 @@ def test_runtime_toggle_virtualcam_flips():
     assert rt.virtualcam_active is True
     rt.toggle_virtualcam()
     assert rt.virtualcam_active is False
+
+
+class _TuningWorker:
+    """Records the tuning published by the runtime (stand-in for TrackingWorker)."""
+
+    def __init__(self):
+        self.published = []
+
+    def set_tuning(self, tuning):
+        self.published.append(tuning)
+
+
+def _runtime_with_worker(worker) -> PipelineRuntime:
+    args = parse_args(["--mode", "skeleton"])
+    return PipelineRuntime(args, _FakePacketWebcam(), worker, Scene(), None, None, None)
+
+
+def test_runtime_set_tuning_clamps_stores_and_publishes():
+    worker = _TuningWorker()
+    rt = _runtime_with_worker(worker)
+    result = rt.set_tuning(0.06, 0.04)  # inverted -> clamp lifts exit above enter
+    # Returns the clamp, records it as runtime-authoritative, and publishes it.
+    assert result.exit > result.enter
+    assert rt.tuning == result
+    assert worker.published == [result]  # single atomic publish to the worker
+
+
+def test_runtime_set_tuning_without_worker_still_updates_state():
+    rt = _image_runtime()  # worker is None
+    result = rt.set_tuning(0.04, 0.09)
+    assert rt.tuning == result  # no crash without a worker; state still updated
+
+
+def test_runtime_tuning_initialized_from_param():
+    args = parse_args(["--mode", "skeleton"])
+    rt = PipelineRuntime(
+        args, _FakePacketWebcam(), None, Scene(), None, None, None,
+        tuning=GestureTuning(0.03, 0.06),
+    )
+    assert rt.tuning == GestureTuning(0.03, 0.06)
 
 
 def test_runtime_add_image_layer_success_sets_status():
@@ -948,15 +1081,33 @@ class _SettingsPanel:
         }
 
 
+_TUNING = GestureTuning(0.04, 0.09)
+_CONFIDENCE = TrackerConfidence(0.6, 0.7, 0.8)
+
+
 def test_final_settings_runtime_vcam_overrides_frozen_panel_checkbox():
     args = parse_args(["--mode", "skeleton"])
-    out = _final_settings(_SettingsPanel(), args, True)
+    out = _final_settings(_SettingsPanel(), args, True, _TUNING, _CONFIDENCE)
     assert out["virtualcam"] is True  # runtime toggle is authoritative
     assert out["window_title"] == "Pad"  # other fields still from the panel
 
 
 def test_final_settings_without_panel_uses_args():
     args = parse_args(["--mode", "image", "--image", "a.png"])
-    out = _final_settings(None, args, False)
+    out = _final_settings(None, args, False, _TUNING, _CONFIDENCE)
     assert out["image_path"] == "a.png"
     assert out["virtualcam"] is False
+
+
+def test_final_settings_overlays_tuning_and_confidence():
+    # Both the panel path and the no-panel path must carry the runtime tuning +
+    # the startup confidences (the panel has no widget for the confidences).
+    args = parse_args(["--mode", "skeleton"])
+    with_panel = _final_settings(_SettingsPanel(), args, True, _TUNING, _CONFIDENCE)
+    without_panel = _final_settings(None, args, True, _TUNING, _CONFIDENCE)
+    for out in (with_panel, without_panel):
+        assert out["pinch_enter"] == 0.04
+        assert out["pinch_exit"] == 0.09
+        assert out["min_detection_confidence"] == 0.6
+        assert out["min_presence_confidence"] == 0.7
+        assert out["min_tracking_confidence"] == 0.8

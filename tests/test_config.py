@@ -18,6 +18,11 @@ def test_default_config_has_expected_keys_and_values():
         "window_title": "",
         "monitor_index": 1,
         "virtualcam": False,
+        "pinch_enter": 0.05,
+        "pinch_exit": 0.07,
+        "min_detection_confidence": 0.5,
+        "min_presence_confidence": 0.5,
+        "min_tracking_confidence": 0.5,
     }
 
 
@@ -35,6 +40,11 @@ def test_merge_overlays_loaded_values_over_defaults():
             "window_title": "Notepad",
             "monitor_index": 2,
             "virtualcam": True,
+            "pinch_enter": 0.04,
+            "pinch_exit": 0.09,
+            "min_detection_confidence": 0.6,
+            "min_presence_confidence": 0.7,
+            "min_tracking_confidence": 0.8,
         }
     )
     assert merged == {
@@ -43,6 +53,11 @@ def test_merge_overlays_loaded_values_over_defaults():
         "window_title": "Notepad",
         "monitor_index": 2,
         "virtualcam": True,
+        "pinch_enter": 0.04,
+        "pinch_exit": 0.09,
+        "min_detection_confidence": 0.6,
+        "min_presence_confidence": 0.7,
+        "min_tracking_confidence": 0.8,
     }
 
 
@@ -96,9 +111,63 @@ def test_save_then_load_roundtrips(tmp_path):
         "window_title": "Term",
         "monitor_index": 2,
         "virtualcam": True,
+        "pinch_enter": 0.04,
+        "pinch_exit": 0.09,
+        "min_detection_confidence": 0.6,
+        "min_presence_confidence": 0.7,
+        "min_tracking_confidence": 0.8,
     }
     config.save_config(path, settings)
     assert config.load_config(path) == settings
+
+
+# --------------------------------------------------------------------------- #
+# New keys (pinch tuning + startup confidences) validation
+# --------------------------------------------------------------------------- #
+
+def test_merge_defaults_pinch_when_absent():
+    merged = config.merge_config({"source": "image"})
+    assert merged["pinch_enter"] == 0.05
+    assert merged["pinch_exit"] == 0.07
+
+
+def test_merge_rejects_out_of_range_or_wrongtype_pinch():
+    # Wrong type / out of range -> that key falls back to its default.
+    merged = config.merge_config({"pinch_enter": "lots", "pinch_exit": 99.0})
+    assert merged["pinch_enter"] == 0.05
+    assert merged["pinch_exit"] == 0.07
+
+
+def test_merge_enforces_hysteresis_gap_on_pinch_pair():
+    # Both in range but inverted -> the shared clamp lifts exit above enter.
+    merged = config.merge_config({"pinch_enter": 0.08, "pinch_exit": 0.06})
+    assert merged["pinch_enter"] == 0.08
+    assert merged["pinch_exit"] > merged["pinch_enter"]
+
+
+def test_merge_rejects_bool_pinch_values():
+    merged = config.merge_config({"pinch_enter": True, "pinch_exit": False})
+    assert merged["pinch_enter"] == 0.05
+    assert merged["pinch_exit"] == 0.07
+
+
+def test_merge_validates_confidence_range():
+    merged = config.merge_config(
+        {
+            "min_detection_confidence": 0.9,
+            "min_presence_confidence": 1.5,   # out of range -> default
+            "min_tracking_confidence": "x",   # wrong type -> default
+        }
+    )
+    assert merged["min_detection_confidence"] == 0.9
+    assert merged["min_presence_confidence"] == 0.5
+    assert merged["min_tracking_confidence"] == 0.5
+
+
+def test_merge_rejects_bool_confidence():
+    assert config.merge_config({"min_detection_confidence": True})[
+        "min_detection_confidence"
+    ] == 0.5
 
 
 def test_save_merges_incomplete_dict(tmp_path):

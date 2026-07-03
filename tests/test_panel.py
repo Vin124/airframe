@@ -7,6 +7,7 @@ thin binding over the actions verified below.
 """
 
 from src.panel import PanelActions, format_fps
+from src.tuning import GestureTuning, clamp_tuning
 
 
 def test_format_fps_none_is_dash():
@@ -42,6 +43,10 @@ class _FakeRuntime:
     def reset_scene(self):
         self.calls.append(("reset",))
 
+    def set_tuning(self, enter, exit):
+        self.calls.append(("tuning", enter, exit))
+        return clamp_tuning(enter, exit)
+
 
 def test_from_runtime_wires_action_callables():
     rt = _FakeRuntime()
@@ -60,6 +65,16 @@ def test_from_runtime_wires_action_callables():
         ("toggle",),
         ("reset",),
     ]
+
+
+def test_from_runtime_wires_set_tuning_and_returns_clamp():
+    rt = _FakeRuntime()
+    actions = PanelActions.from_runtime(rt)
+
+    result = actions.set_tuning(0.06, 0.04)  # inverted -> clamp lifts exit
+    assert rt.calls == [("tuning", 0.06, 0.04)]
+    assert isinstance(result, GestureTuning)
+    assert result.exit > result.enter  # hysteresis gap enforced by the runtime
 
 
 def test_from_runtime_getters_read_live_state():

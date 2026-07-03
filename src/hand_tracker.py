@@ -25,6 +25,8 @@ from mediapipe.tasks.python.vision import (
     RunningMode,
 )
 
+from src.tuning import TrackerConfidence
+
 # 21 landmarks per hand, each an (x, y, z) triple in normalized [0, 1] space.
 LANDMARKS_PER_HAND = 21
 
@@ -108,15 +110,27 @@ def landmarks_to_hands(hand_landmarks_list) -> List[Hand]:
 
 
 def _build_options(
-    model_path: Path, num_hands: int, delegate: "BaseOptions.Delegate"
+    model_path: Path,
+    num_hands: int,
+    delegate: "BaseOptions.Delegate",
+    confidence: TrackerConfidence,
 ) -> HandLandmarkerOptions:
-    """Build VIDEO-mode landmarker options for a specific compute delegate."""
+    """Build VIDEO-mode landmarker options for a specific compute delegate.
+
+    ``confidence`` maps onto MediaPipe's three startup-only min-confidence knobs
+    (detection / presence / tracking). These live in the options object, so a
+    change needs a fresh landmarker -- hence they are CLI/config-resolved, never
+    a live slider (see ``src.tuning.TrackerConfidence``).
+    """
     return HandLandmarkerOptions(
         base_options=BaseOptions(
             model_asset_path=str(model_path), delegate=delegate
         ),
         running_mode=RunningMode.VIDEO,
         num_hands=num_hands,
+        min_hand_detection_confidence=confidence.detection,
+        min_hand_presence_confidence=confidence.presence,
+        min_tracking_confidence=confidence.tracking,
     )
 
 
@@ -125,6 +139,7 @@ def create_landmarker(
     model_path: Path,
     num_hands: int,
     gpu: bool,
+    confidence: TrackerConfidence = TrackerConfidence(),
 ) -> HandLandmarker:
     """Create the landmarker, honoring a GPU-delegate request with CPU fallback.
 
@@ -133,20 +148,27 @@ def create_landmarker(
     clear line and fall back to the CPU delegate. A CPU-delegate failure is fatal
     (there's nothing left to fall back to) and surfaces as ``HandTrackerError``.
 
+    ``confidence`` carries MediaPipe's startup-only min-confidence knobs into the
+    options for whichever delegate is used.
+
     Chunk 3 deferral: this flag only requests MediaPipe's built-in GPU delegate.
     A full ONNX Runtime / TensorRT port of the hand model is intentionally NOT
     attempted here (see spec.md's out-of-scope notes).
     """
     if gpu:
         try:
-            return factory(_build_options(model_path, num_hands, BaseOptions.Delegate.GPU))
+            return factory(
+                _build_options(model_path, num_hands, BaseOptions.Delegate.GPU, confidence)
+            )
         except Exception as exc:  # noqa: BLE001 - any GPU init failure -> CPU
             print(
                 f"GPU delegate unavailable ({exc}); falling back to CPU.",
                 file=sys.stderr,
             )
     try:
-        return factory(_build_options(model_path, num_hands, BaseOptions.Delegate.CPU))
+        return factory(
+            _build_options(model_path, num_hands, BaseOptions.Delegate.CPU, confidence)
+        )
     except Exception as exc:  # MediaPipe raises broad RuntimeError subtypes here
         raise HandTrackerError(
             f"Failed to initialize the MediaPipe HandLandmarker: {exc}"
@@ -162,6 +184,9 @@ class HandTracker:
 
     ``gpu=True`` requests the GPU delegate and cleanly falls back to CPU with a
     one-line notice when it isn't available (see ``create_landmarker``).
+    ``confidence`` sets MediaPipe's three startup-only min-confidence knobs
+    (detection / presence / tracking); they bake into the landmarker, so they are
+    CLI/config-resolved once at construction, not live-tunable.
     """
 
     def __init__(
@@ -170,10 +195,13 @@ class HandTracker:
         model_path: Path = MODELS_DIR / MODEL_FILENAME,
         gpu: bool = False,
         landmarker_factory: Optional[LandmarkerFactory] = None,
+        confidence: TrackerConfidence = TrackerConfidence(),
     ) -> None:
         resolved_model = ensure_model(model_path=model_path)
         factory = landmarker_factory or HandLandmarker.create_from_options
-        self._landmarker = create_landmarker(factory, resolved_model, num_hands, gpu)
+        self._landmarker = create_landmarker(
+            factory, resolved_model, num_hands, gpu, confidence
+        )
 
         # VIDEO mode requires strictly increasing timestamps (milliseconds).
         self._last_timestamp_ms = -1

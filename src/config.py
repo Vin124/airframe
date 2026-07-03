@@ -2,7 +2,10 @@
 
 Pure load/save/merge helpers so the panel and the runtime can round-trip a
 handful of settings -- last source choice, image path, window title, monitor
-index, and virtual-cam on/off -- across runs without needing a UI or a display.
+index, virtual-cam on/off, the live pinch thresholds (``pinch_enter`` /
+``pinch_exit``, panel sliders), and the startup-only MediaPipe min-confidence
+knobs (``min_detection_confidence`` / ``min_presence_confidence`` /
+``min_tracking_confidence``) -- across runs without needing a UI or a display.
 
 Design points:
   - Everything here is a pure function of its inputs (plus the file at ``path``);
@@ -25,6 +28,17 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+from src.tuning import (
+    CONFIDENCE_MAX,
+    CONFIDENCE_MIN,
+    DEFAULT_MEDIAPIPE_CONFIDENCE,
+    DEFAULT_PINCH_ENTER,
+    DEFAULT_PINCH_EXIT,
+    PINCH_THRESHOLD_MAX,
+    PINCH_THRESHOLD_MIN,
+    clamp_tuning,
+)
+
 # Written to the current working directory (the repo root when launched via
 # ``python -m src.main``). Git-ignored -- it's per-user local state.
 CONFIG_FILENAME = "handy_config.json"
@@ -40,18 +54,42 @@ _VALID_SOURCES = (SOURCE_IMAGE, SOURCE_WINDOW, SOURCE_SCREEN)
 # windows-capture indexes monitors 1-based (1 = primary); anything < 1 is invalid.
 _DEFAULT_MONITOR_INDEX = 1
 
+# MediaPipe's three startup-only min-confidence knobs, persisted so a CLI-set
+# value round-trips. See ``src.tuning.TrackerConfidence`` / ``resolve_panel_prefill``.
+_CONFIDENCE_KEYS = (
+    "min_detection_confidence",
+    "min_presence_confidence",
+    "min_tracking_confidence",
+)
+
 _DEFAULTS: Dict[str, Any] = {
     "source": SOURCE_IMAGE,
     "image_path": "",
     "window_title": "",
     "monitor_index": _DEFAULT_MONITOR_INDEX,
     "virtualcam": False,
+    # Live pinch tuning (panel sliders); clamped as a pair so exit > enter.
+    "pinch_enter": DEFAULT_PINCH_ENTER,
+    "pinch_exit": DEFAULT_PINCH_EXIT,
+    # Startup-only MediaPipe confidences (CLI/config, not sliders).
+    "min_detection_confidence": DEFAULT_MEDIAPIPE_CONFIDENCE,
+    "min_presence_confidence": DEFAULT_MEDIAPIPE_CONFIDENCE,
+    "min_tracking_confidence": DEFAULT_MEDIAPIPE_CONFIDENCE,
 }
 
 
 def default_config() -> Dict[str, Any]:
     """Return a fresh copy of the built-in defaults (never the shared dict)."""
     return dict(_DEFAULTS)
+
+
+def _number_in_range(value: Any, low: float, high: float) -> bool:
+    """True iff ``value`` is a real (non-bool) number within ``[low, high]``."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and low <= value <= high
+    )
 
 
 def merge_config(loaded: Any) -> Dict[str, Any]:
@@ -86,6 +124,32 @@ def merge_config(loaded: Any) -> Dict[str, Any]:
     virtualcam = loaded.get("virtualcam")
     if isinstance(virtualcam, bool):
         config["virtualcam"] = virtualcam
+
+    # Pinch tuning: accept each value only if it's a number inside the slider
+    # range (else fall back to that key's default), then run the PAIR through the
+    # shared clamp so the hysteresis gap (exit > enter) is always enforced --
+    # exactly the same validation boundary the panel slider path uses.
+    pinch_enter = loaded.get("pinch_enter")
+    pinch_exit = loaded.get("pinch_exit")
+    enter = (
+        pinch_enter
+        if _number_in_range(pinch_enter, PINCH_THRESHOLD_MIN, PINCH_THRESHOLD_MAX)
+        else DEFAULT_PINCH_ENTER
+    )
+    exit = (
+        pinch_exit
+        if _number_in_range(pinch_exit, PINCH_THRESHOLD_MIN, PINCH_THRESHOLD_MAX)
+        else DEFAULT_PINCH_EXIT
+    )
+    tuning = clamp_tuning(enter, exit)
+    config["pinch_enter"] = tuning.enter
+    config["pinch_exit"] = tuning.exit
+
+    # Startup-only MediaPipe confidences: each a float in [0, 1] or its default.
+    for key in _CONFIDENCE_KEYS:
+        value = loaded.get(key)
+        if _number_in_range(value, CONFIDENCE_MIN, CONFIDENCE_MAX):
+            config[key] = float(value)
 
     return config
 

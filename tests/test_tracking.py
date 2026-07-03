@@ -15,6 +15,7 @@ from src.tracking import (
     detect_and_update,
     initial_result,
 )
+from src.tuning import GestureTuning
 
 
 class _FakeTracker:
@@ -35,10 +36,14 @@ class _FakeTracker:
 
 
 class _FakeDetector:
-    """Stand-in for GestureDetector: echoes whether a hand was present."""
+    """Stand-in for GestureDetector: echoes hand presence, records threshold swaps."""
 
     def __init__(self) -> None:
         self.updates = []
+        self.thresholds = None  # last (enter, exit) applied via set_thresholds
+
+    def set_thresholds(self, enter, exit):
+        self.thresholds = (enter, exit)
 
     def update(self, hand):
         self.updates.append(hand)
@@ -172,6 +177,46 @@ def test_crash_publishes_idle_result(capsys):
     assert idle.hands == ()
     assert len(idle.gesture_states) == 1  # one per detector
     assert all(not g.is_pinching for g in idle.gesture_states)
+
+
+# --------------------------------------------------------------------------- #
+# Live tuning: set_tuning atomic publish + per-poll apply to owned detectors
+# --------------------------------------------------------------------------- #
+
+def test_set_tuning_applies_to_detectors_on_next_poll():
+    detectors = [_FakeDetector(), _FakeDetector()]
+    worker = TrackingWorker(_FakeTracker(), detectors, _provider([(1, _frame())]))
+    worker.set_tuning(GestureTuning(0.03, 0.06))
+    assert all(d.thresholds is None for d in detectors)  # not applied until poll
+    worker.poll_once()
+    assert all(d.thresholds == (0.03, 0.06) for d in detectors)
+
+
+def test_set_tuning_applies_even_without_a_new_frame():
+    # No frame -> poll_once returns False, but a pending tuning must still land so
+    # a slider nudge isn't stuck waiting on the next camera frame.
+    detector = _FakeDetector()
+    worker = TrackingWorker(_FakeTracker(), [detector], _provider([]))
+    worker.set_tuning(GestureTuning(0.04, 0.07))
+    assert worker.poll_once() is False
+    assert detector.thresholds == (0.04, 0.07)
+
+
+def test_tuning_applied_once_then_reapplied_on_change():
+    detector = _FakeDetector()
+    worker = TrackingWorker(
+        _FakeTracker(hands_sequence=[[], [], []]),
+        [detector],
+        _provider([(1, _frame()), (2, _frame()), (3, _frame())]),
+    )
+    worker.set_tuning(GestureTuning(0.03, 0.06))
+    worker.poll_once()
+    detector.thresholds = None  # clear to prove the next poll doesn't re-apply
+    worker.poll_once()
+    assert detector.thresholds is None  # same tuning reference -> not re-applied
+    worker.set_tuning(GestureTuning(0.05, 0.09))  # a new reference
+    worker.poll_once()
+    assert detector.thresholds == (0.05, 0.09)
 
 
 def test_stop_is_safe_before_start():

@@ -16,6 +16,15 @@ State ownership (the app's single-writer rule):
     atomic reference store (GIL-safe, no lock), the same discipline the capture
     sources use for frames.
 
+Live pinch tuning:
+    The panel sliders retune pinch detection without touching detector internals
+    from the main thread. ``set_tuning`` publishes an immutable ``GestureTuning``
+    via a single atomic reference store (main thread -> this thread); each poll
+    reads it and, when the reference changed, swaps the thresholds onto the
+    detectors THIS thread owns (``GestureDetector.set_thresholds``). So the main
+    thread never mutates a detector -- it only hands off an immutable snapshot,
+    the same latest-wins discipline as frames and results.
+
 Cadence + dedup:
     The worker processes a frame only when the capture source publishes a NEW one
     (tracked by sequence number); between new frames it sleeps briefly instead of
@@ -44,6 +53,7 @@ import numpy as np
 from src.gestures import GestureDetector, GestureState
 from src.hand_tracker import Hand, HandTracker
 from src.timing import StageTimer
+from src.tuning import GestureTuning
 
 # Poll interval when no new frame is available yet, so the worker doesn't
 # busy-spin between camera frames. Small relative to the ~40ms detect cost.
@@ -137,6 +147,13 @@ class TrackingWorker:
         self._clock = clock
         self._result = initial_result(len(detectors))
         self._last_seq = 0
+        # Live pinch tuning: the main thread publishes a new GestureTuning here
+        # (one atomic reference store); this thread applies it between frames and
+        # records which reference it applied so a fresh publish is never missed
+        # or re-applied. None = "no live change yet" (detectors keep the
+        # thresholds they were constructed with -- the resolved startup config).
+        self._pending_tuning: Optional[GestureTuning] = None
+        self._applied_tuning: Optional[GestureTuning] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.error: Optional[Exception] = None
@@ -154,15 +171,41 @@ class TrackingWorker:
         """Return the most recently published result (never blocks)."""
         return self._result
 
+    def set_tuning(self, tuning: GestureTuning) -> None:
+        """Publish new pinch thresholds for this thread to apply (main thread).
+
+        A single atomic reference store (GIL-safe, no lock). The tracking thread
+        picks it up on its next poll and swaps it onto the detectors it owns --
+        the main thread never touches detector internals. ``tuning`` must already
+        be clamped (see ``src.tuning.clamp_tuning``).
+        """
+        self._pending_tuning = tuning
+
+    def _apply_pending_tuning(self) -> None:
+        """Swap a freshly published tuning onto the owned detectors (this thread).
+
+        Compares by identity against the last-applied reference, so a new publish
+        (``clamp_tuning`` always returns a fresh object) is applied exactly once
+        and a concurrent re-publish is never lost -- no clear-to-None race.
+        """
+        tuning = self._pending_tuning  # one atomic read
+        if tuning is not None and tuning is not self._applied_tuning:
+            for detector in self._detectors:
+                detector.set_thresholds(tuning.enter, tuning.exit)
+            self._applied_tuning = tuning
+
     def poll_once(self) -> bool:
         """Process the newest frame if it's new; return True iff a detect ran.
 
-        Skips (returns False) when there's no frame yet or the newest one shares
-        the sequence already processed -- the whole point of running at its own
+        Applies any freshly published pinch tuning FIRST (so a slider nudge takes
+        effect even on a frame the worker would otherwise skip), then skips
+        (returns False) when there's no frame yet or the newest one shares the
+        sequence already processed -- the whole point of running at its own
         cadence is to never re-detect the same pixels. On a genuinely new frame it
         detects + updates gestures and publishes the result. Exceptions propagate
         (the loop's crash policy handles them). Exposed for deterministic tests.
         """
+        self._apply_pending_tuning()
         packet = self._frame_provider()
         if packet is None or packet[0] == self._last_seq:
             return False

@@ -13,14 +13,23 @@ python -m src.main --mode image --source window --window-title "Notepad"  # grab
 python -m src.main --mode image --source screen --monitor-index 1         # grab a monitor (1-based)
 python -m src.main --mode skeleton --gpu      # request GPU delegate (falls back to CPU on Windows)
 python -m src.main --mode image --image assets/test.png --no-panel  # hotkeys only, no control panel
+python -m src.main --mode skeleton --min-detection-confidence 0.7 --min-tracking-confidence 0.6  # startup-only MediaPipe confidences
 ```
 A small **Tkinter control panel** opens alongside the preview by default (Phase
-10): pick a source (image file picker / window title / monitor index) and add it
-as a layer, toggle the virtual cam, reset the scene, watch a live FPS readout.
-Its buttons drive the same runtime the hotkeys use. Pass `--no-panel` to run
-hotkey-only. Last-used panel settings persist to `handy_config.json` (repo root,
-git-ignored) on exit and pre-fill on start; precedence is **CLI > config >
-defaults**.
+10): pick a source (image file picker / editable window-title dropdown / monitor
+index) and add it as a layer, toggle the virtual cam, reset the scene, retune
+pinch detection with two live sliders (pinch ENTER / EXIT threshold), watch a
+live FPS readout. The window-title dropdown re-enumerates open top-level windows
+each time it opens (`src/window_list.py`, ctypes `EnumWindows`, no new dep) and
+stays editable so a custom substring still works. Its buttons/sliders drive the
+same runtime the hotkeys use. Pass `--no-panel` to run hotkey-only. Last-used
+panel settings persist to `handy_config.json` (repo root, git-ignored) on exit
+and pre-fill on start; precedence is **CLI > config > defaults**.
+
+Persisted config keys: `source`, `image_path`, `window_title`, `monitor_index`,
+`virtualcam`, `pinch_enter` / `pinch_exit` (live slider thresholds), and
+`min_detection_confidence` / `min_presence_confidence` / `min_tracking_confidence`
+(startup-only MediaPipe knobs, also `--min-*-confidence` flags).
 
 Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
 `v` toggle virtual cam. Image-mode multi-layer: `a`/`w`/`m` add an image / window
@@ -34,7 +43,7 @@ As of Phase 9 the stages are decoupled across threads (see Threading model below
 ```
 src/main.py           # entry: argparse, mode dispatch, PipelineRuntime (main loop), thread wiring; re-exports the moved helpers/constants (layers, launch) for the test surface
 src/layers.py         # scene/source-layer transitions (build/add/remove/fit) + the mode/source/layer-key vocabulary; camera-free + unit-testable
-src/launch.py         # launch-time settings glue: panel prefill, config <-> args, panel build (lazy Tk import)
+src/launch.py         # launch glue: CLI parsing, panel prefill, config <-> args, panel build (lazy Tk import)
 src/runtime note      #   PipelineRuntime lives in main.py (kept there to avoid a circular import
                       #   with the tested loop helpers in layers.py); run() is a thin setup/teardown shell
 src/camera.py         # low-level webcam open/read/release
@@ -42,7 +51,9 @@ src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; -
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
-src/gestures.py       # pinch/grab detection from landmarks
+src/gestures.py       # pinch/grab detection from landmarks; per-instance enter/exit thresholds (live-tunable)
+src/tuning.py         # dependency-light GestureTuning + TrackerConfidence snapshots + clamp_tuning (the one hysteresis-gap boundary, shared by panel + config)
+src/window_list.py    # list_window_titles(): open top-level window titles via ctypes EnumWindows (panel dropdown); injectable + failure-safe ([])
 src/hud.py            # heads-up display text + strip (incl. per-stage timing line)
 src/fps.py            # frame-rate counter (loop rate)
 src/panel.py          # Tkinter control panel + PanelActions controller (Phase 10); pumped by PipelineRuntime
@@ -92,6 +103,18 @@ publish per hand-off, GIL-safe, latest-frame-wins):
 
 ## Gotchas
 - Prefer MediaPipe Tasks API (`HandLandmarker`, `hand_landmarker.task`) in VIDEO/LIVE_STREAM mode; fall back to legacy `mp.solutions.hands` only if the installed version makes that simpler.
+- Pinch thresholds are LIVE-tunable via the panel sliders: a slider publishes a
+  frozen `GestureTuning` from the main thread to the tracking thread (one atomic
+  ref store, `TrackingWorker.set_tuning`), which swaps it onto the detectors it
+  owns — the main thread never touches detector internals. `clamp_tuning` (in
+  `src/tuning.py`) is the ONE boundary enforcing `exit > enter` (a minimum gap),
+  used by BOTH the slider path and config load, so an inverted/equal pair can
+  never reintroduce pinch-label flicker.
+- The three MediaPipe min-confidence params (`--min-detection-confidence`,
+  `--min-presence-confidence`, `--min-tracking-confidence`) are STARTUP-ONLY:
+  they bake into the `HandLandmarker` options, so changing them needs a tracker
+  re-init. Hence they are CLI/config flags, NOT live sliders (unlike pinch
+  thresholds). Persisted + resolved with the same CLI > config > default rule.
 - `--gpu` requests MediaPipe's built-in GPU delegate and falls back to CPU with a one-line notice when it's unavailable — which is the expected case for MediaPipe's Python wheels on Windows. A full ONNX Runtime / TensorRT port of the hand model is deferred to Chunk 3.
 - Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+).
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.

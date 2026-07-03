@@ -35,6 +35,14 @@ from tkinter import filedialog, ttk
 from typing import Any, Callable, Dict, Optional
 
 from src import hud
+from src.tuning import (
+    DEFAULT_PINCH_ENTER,
+    DEFAULT_PINCH_EXIT,
+    PINCH_THRESHOLD_MAX,
+    PINCH_THRESHOLD_MIN,
+    GestureTuning,
+)
+from src.window_list import list_window_titles
 
 # Source-choice values, mirroring src.main / src.config (same literals).
 SOURCE_IMAGE = "image"
@@ -79,6 +87,7 @@ class PanelActions:
     add_screen_layer: Callable[[int], None]
     toggle_virtualcam: Callable[[], None]
     reset_scene: Callable[[], None]
+    set_tuning: Callable[[float, float], GestureTuning]
     get_fps: Callable[[], Optional[float]]
     get_virtualcam_active: Callable[[], bool]
     get_status: Callable[[], Optional[str]]
@@ -92,6 +101,7 @@ class PanelActions:
             add_screen_layer=runtime.add_screen_layer,
             toggle_virtualcam=runtime.toggle_virtualcam,
             reset_scene=runtime.reset_scene,
+            set_tuning=runtime.set_tuning,
             get_fps=lambda: runtime.last_fps,
             get_virtualcam_active=lambda: runtime.virtualcam_active,
             get_status=lambda: runtime.panel_status,
@@ -99,12 +109,13 @@ class PanelActions:
 
 
 class ControlPanel:
-    """Thin Tk view: source picker + add, vcam toggle, reset, FPS readout.
+    """Thin Tk view: source picker + add, vcam toggle, reset, tuning, FPS readout.
 
     Bind widgets to a ``PanelActions``; refresh read-only state each ``pump()``.
-    All three source-input fields (image path + Browse, window title, monitor
-    index) are always visible; ``Add layer`` reads whichever matches the selected
-    source. Pre-filled from ``prefill`` (resolved CLI > config > defaults upstream).
+    All three source-input fields (image path + Browse, window-title combobox,
+    monitor index) are always visible; ``Add layer`` reads whichever matches the
+    selected source. Two pinch-tuning sliders (ENTER / EXIT) retune tracking live.
+    Pre-filled from ``prefill`` (resolved CLI > config > defaults upstream).
     """
 
     def __init__(self, actions: PanelActions, prefill: Optional[Dict[str, Any]] = None) -> None:
@@ -129,6 +140,13 @@ class ControlPanel:
         self._vcam_var = tk.BooleanVar(value=bool(prefill.get("virtualcam", False)))
         self._fps_var = tk.StringVar(value=_NO_FPS_TEXT)
         self._status_var = tk.StringVar(value="")
+
+        # Pinch-tuning sliders: DoubleVars hold the slider positions; the string
+        # vars show the live (clamped) numeric values next to them.
+        self._enter_var = tk.DoubleVar(value=float(prefill.get("pinch_enter", DEFAULT_PINCH_ENTER)))
+        self._exit_var = tk.DoubleVar(value=float(prefill.get("pinch_exit", DEFAULT_PINCH_EXIT)))
+        self._enter_value_var = tk.StringVar(value=f"{self._enter_var.get():.3f}")
+        self._exit_value_var = tk.StringVar(value=f"{self._exit_var.get():.3f}")
 
         self._build_widgets()
 
@@ -156,10 +174,17 @@ class ControlPanel:
             row=1, column=2, padx=4
         )
 
+        # Editable combobox of currently-open window titles. ``postcommand``
+        # re-enumerates every time the dropdown opens (titles change constantly);
+        # it stays editable so a custom substring can still be typed.
         ttk.Label(frame, text="Window title:").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self._title_var, width=28).grid(
-            row=2, column=1, sticky="we", pady=2
+        self._title_combo = ttk.Combobox(
+            frame,
+            textvariable=self._title_var,
+            width=26,
+            postcommand=self._refresh_window_titles,
         )
+        self._title_combo.grid(row=2, column=1, sticky="we", pady=2)
 
         ttk.Label(frame, text="Monitor:").grid(row=3, column=0, sticky="w")
         ttk.Spinbox(frame, from_=1, to=16, textvariable=self._monitor_var, width=6).grid(
@@ -185,17 +210,56 @@ class ControlPanel:
             row=7, column=0, columnspan=3, sticky="we", pady=6
         )
 
+        # Live pinch tuning. Moving either slider retunes tracking immediately
+        # (publishes a GestureTuning to the tracking thread); the numeric labels
+        # snap to the clamped effective value. Defaults are marked in the labels.
+        ttk.Label(frame, text="Pinch tuning (live):").grid(
+            row=8, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(frame, text=f"Enter (def {DEFAULT_PINCH_ENTER:.2f}):").grid(
+            row=9, column=0, sticky="w"
+        )
+        ttk.Scale(
+            frame,
+            from_=PINCH_THRESHOLD_MIN,
+            to=PINCH_THRESHOLD_MAX,
+            orient="horizontal",
+            variable=self._enter_var,
+            command=self._on_tuning_change,
+        ).grid(row=9, column=1, sticky="we", pady=2)
+        ttk.Label(frame, textvariable=self._enter_value_var, width=6).grid(
+            row=9, column=2, sticky="w"
+        )
+        ttk.Label(frame, text=f"Exit (def {DEFAULT_PINCH_EXIT:.2f}):").grid(
+            row=10, column=0, sticky="w"
+        )
+        ttk.Scale(
+            frame,
+            from_=PINCH_THRESHOLD_MIN,
+            to=PINCH_THRESHOLD_MAX,
+            orient="horizontal",
+            variable=self._exit_var,
+            command=self._on_tuning_change,
+        ).grid(row=10, column=1, sticky="we", pady=2)
+        ttk.Label(frame, textvariable=self._exit_value_var, width=6).grid(
+            row=10, column=2, sticky="w"
+        )
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=11, column=0, columnspan=3, sticky="we", pady=6
+        )
+
         ttk.Label(frame, textvariable=self._fps_var).grid(
-            row=8, column=0, columnspan=2, sticky="w"
+            row=12, column=0, columnspan=2, sticky="w"
         )
         ttk.Label(frame, textvariable=self._status_var, foreground="#888").grid(
-            row=9, column=0, columnspan=3, sticky="w"
+            row=13, column=0, columnspan=3, sticky="w"
         )
 
         # Hotkey hint -- reuse the HUD's legend so the two never drift apart.
         for i, line in enumerate(hud.KEY_LEGEND_LINES):
             ttk.Label(frame, text=line, foreground="#888").grid(
-                row=10 + i, column=0, columnspan=3, sticky="w"
+                row=14 + i, column=0, columnspan=3, sticky="w"
             )
 
     # -- widget callbacks (run inline on the main thread via pump()) ------- #
@@ -228,6 +292,26 @@ class ControlPanel:
     def _on_reset_scene(self) -> None:
         self._actions.reset_scene()
         self._refresh()
+
+    def _refresh_window_titles(self) -> None:
+        """Re-enumerate open window titles into the combobox (dropdown ``postcommand``).
+
+        ``list_window_titles`` already swallows any enumeration failure (returns
+        []), so this can never raise into Tk and stall the dropdown.
+        """
+        self._title_combo["values"] = list_window_titles()
+
+    def _on_tuning_change(self, _value: Optional[str] = None) -> None:
+        """Slider moved: retune tracking live and snap the labels to the clamp.
+
+        Tk passes the new slider value as a string; it's ignored -- both slider
+        vars are read together so the clamp always sees the current pair. The
+        clamped result drives the numeric labels (so a below-enter exit visibly
+        snaps up) without moving the slider handles mid-drag.
+        """
+        tuning = self._actions.set_tuning(self._enter_var.get(), self._exit_var.get())
+        self._enter_value_var.set(f"{tuning.enter:.3f}")
+        self._exit_value_var.set(f"{tuning.exit:.3f}")
 
     def _on_close(self) -> None:
         """OS window-close: mark closed, keep the app running (hotkeys still work)."""

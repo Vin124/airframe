@@ -35,7 +35,12 @@ import numpy as np
 from src import compositor, config, hud
 from src.camera import CameraError
 from src.fps import FpsCounter
-from src.gestures import GestureDetector, GestureState
+from src.gestures import (
+    PINCH_ENTER_THRESHOLD,
+    PINCH_EXIT_THRESHOLD,
+    GestureDetector,
+    GestureState,
+)
 from src.hand_tracker import HandTracker, HandTrackerError
 from src.interaction import InteractionState, step
 from src.scene import Layer, Scene, Transform
@@ -50,6 +55,12 @@ from src.timing import (
     remaining_sleep_seconds,
 )
 from src.tracking import TrackingResult, TrackingWorker
+from src.tuning import (
+    DEFAULT_MEDIAPIPE_CONFIDENCE,
+    GestureTuning,
+    TrackerConfidence,
+    clamp_tuning,
+)
 
 # Re-exported for the test import surface: tests/test_main.py imports these
 # names from src.main. Their implementations (and the mode/source/layer-key
@@ -91,7 +102,10 @@ from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     _build_panel,
     _config_from_args,
     _final_settings,
+    confidence_from_prefill,
+    parse_args,
     resolve_panel_prefill,
+    tuning_from_prefill,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
@@ -125,79 +139,6 @@ SCALE_DOWN_KEYS = (ord("-"), ord("_"))
 TOGGLE_SKELETON_KEY = ord("s")
 RESET_TRANSFORM_KEY = ord("r")
 TOGGLE_VIRTUALCAM_KEY = ord("v")
-
-
-def parse_args(argv=None) -> argparse.Namespace:
-    """Parse and validate CLI arguments. Exits via argparse on invalid input."""
-    parser = argparse.ArgumentParser(description="Webcam hand-tracking debug harness.")
-    parser.add_argument("--mode", required=True, choices=MODES, help="Which mode to run.")
-    parser.add_argument(
-        "--image",
-        default=None,
-        help="Path to the overlay image (required for --mode image --source image).",
-    )
-    parser.add_argument(
-        "--source",
-        default=SOURCE_IMAGE,
-        choices=SOURCES,
-        help=(
-            "Image-mode overlay source: a static 'image', a live 'window' (by "
-            "title), or a monitor 'screen'. Only valid with --mode image."
-        ),
-    )
-    parser.add_argument(
-        "--window-title",
-        default=None,
-        help="Window title substring to capture (required for --source window).",
-    )
-    parser.add_argument(
-        "--monitor-index",
-        type=int,
-        default=DEFAULT_MONITOR_INDEX,
-        help="1-based monitor index for --source screen (1 = primary display).",
-    )
-    parser.add_argument(
-        "--debug-skeleton",
-        action="store_true",
-        help="In image mode, also draw the hand skeleton + gesture label.",
-    )
-    parser.add_argument(
-        "--virtualcam",
-        action="store_true",
-        help=(
-            "Also broadcast the composited frame to a virtual webcam (OBS "
-            "Virtual Camera backend required) so it can be selected as a "
-            "camera in Zoom/Teams/Meet."
-        ),
-    )
-    parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help=(
-            "Request the MediaPipe GPU delegate for hand tracking. Falls back to "
-            "CPU with a one-line notice when it isn't available (the usual case "
-            "for MediaPipe's Python wheels on Windows)."
-        ),
-    )
-    parser.add_argument(
-        "--no-panel",
-        dest="no_panel",
-        action="store_true",
-        help=(
-            "Run without the Tkinter control panel (hotkeys only). The panel is "
-            "on by default; use this for headless smokes or a keyboard-only run."
-        ),
-    )
-    args = parser.parse_args(argv)
-
-    if args.source in LIVE_SOURCES and args.mode != MODE_IMAGE:
-        parser.error("--source window/screen is only valid with --mode image")
-    if args.mode == MODE_IMAGE and args.source == SOURCE_IMAGE and not args.image:
-        parser.error("--image is required when --mode is 'image' and --source is 'image'")
-    if args.source == SOURCE_WINDOW and not args.window_title:
-        parser.error("--window-title is required when --source is 'window'")
-
-    return args
 
 
 def _draw_debug(frame: np.ndarray, hands, gesture_state: Optional[GestureState]) -> None:
@@ -275,7 +216,11 @@ def _handle_image_key(
     return scene, interaction
 
 
-def _init_mode(args: argparse.Namespace):
+def _init_mode(
+    args: argparse.Namespace,
+    tuning: Optional[GestureTuning] = None,
+    confidence: Optional[TrackerConfidence] = None,
+):
     """Build per-mode state BEFORE opening the camera.
 
     Returns ``(tracker, detectors, scene, interaction)``. Skeleton mode gets a
@@ -285,14 +230,30 @@ def _init_mode(args: argparse.Namespace):
     or bad monitor index fails fast here -- and, for live sources, the capture
     thread only starts once nothing risky follows), then a single-layer selected
     scene. Exits nonzero with a clear message on source/tracker init failure.
+
+    ``tuning`` (resolved pinch thresholds) is threaded into every
+    ``GestureDetector`` so the persisted/config value applies from frame one, not
+    only after a slider nudge; ``confidence`` carries the startup-only MediaPipe
+    min-confidence knobs into the tracker. Both default to the built-ins when
+    omitted (keeps direct callers/tests simple).
     """
+    tuning = tuning if tuning is not None else GestureTuning(
+        PINCH_ENTER_THRESHOLD, PINCH_EXIT_THRESHOLD
+    )
+    confidence = confidence if confidence is not None else TrackerConfidence()
     try:
         if args.mode == MODE_SKELETON:
-            tracker = HandTracker(gpu=args.gpu)
-            return tracker, [GestureDetector()], Scene(), None
+            tracker = HandTracker(gpu=args.gpu, confidence=confidence)
+            detector = GestureDetector(tuning.enter, tuning.exit)
+            return tracker, [detector], Scene(), None
 
-        tracker = HandTracker(num_hands=IMAGE_MODE_NUM_HANDS, gpu=args.gpu)
-        detectors = [GestureDetector() for _ in range(IMAGE_MODE_NUM_HANDS)]
+        tracker = HandTracker(
+            num_hands=IMAGE_MODE_NUM_HANDS, gpu=args.gpu, confidence=confidence
+        )
+        detectors = [
+            GestureDetector(tuning.enter, tuning.exit)
+            for _ in range(IMAGE_MODE_NUM_HANDS)
+        ]
         source = _build_layer_source(args)  # last step that can fail
         scene = Scene.single(Layer(source=source, transform=Transform()))
         return tracker, detectors, scene, InteractionState.initial()
@@ -335,6 +296,7 @@ class PipelineRuntime:
         preview: PreviewSink,
         virtualcam: VirtualCamSink,
         virtualcam_active: Optional[bool] = None,
+        tuning: Optional[GestureTuning] = None,
     ) -> None:
         self._args = args
         self._webcam = webcam
@@ -343,6 +305,12 @@ class PipelineRuntime:
         self._virtualcam = virtualcam
         self.scene = scene
         self.interaction = interaction
+        # Last-applied pinch tuning (runtime-authoritative, driven by the panel
+        # sliders via set_tuning). Defaults to the built-ins; run() passes the
+        # resolved startup value so it matches the detectors' initial thresholds.
+        self.tuning = tuning if tuning is not None else GestureTuning(
+            PINCH_ENTER_THRESHOLD, PINCH_EXIT_THRESHOLD
+        )
         self.show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
         # Initial virtual-cam state: the resolved CLI-or-config value (see
         # resolve_panel_prefill). Defaults to the --virtualcam flag when unset so
@@ -593,6 +561,23 @@ class PipelineRuntime:
         """Panel action: flip the virtual-cam sink on/off (shares state with 'v')."""
         self.virtualcam_active = not self.virtualcam_active
 
+    def set_tuning(self, enter: float, exit: float) -> GestureTuning:
+        """Panel action: retune pinch thresholds live (main thread). Returns the clamp.
+
+        Runs the raw slider pair through the shared ``clamp_tuning`` (enforcing
+        the hysteresis gap), records it as the runtime-authoritative tuning (so it
+        persists on exit), and publishes it to the tracking worker via one atomic
+        reference store -- the worker swaps it onto the detectors it owns. The
+        main thread NEVER touches detector internals. Returns the clamped tuning
+        so the panel can snap its numeric labels to the effective values. A worker
+        of ``None`` (skeleton smokes / tests) just updates the stored tuning.
+        """
+        tuning = clamp_tuning(enter, exit)
+        self.tuning = tuning
+        if self._worker is not None:
+            self._worker.set_tuning(tuning)
+        return tuning
+
     def reset_scene(self) -> None:
         """Panel action: remove ALL layers (closing each source) and idle interaction.
 
@@ -632,8 +617,14 @@ def run(args: argparse.Namespace) -> None:
     """
     cfg = config.load_config(config.CONFIG_FILENAME)
     prefill = resolve_panel_prefill(args, cfg)
+    # Resolved startup tuning (tuning_from_prefill clamps, so the hysteresis
+    # invariant holds even if cfg was bypassed) + startup-only confidences. The
+    # detectors are built WITH the tuning so the persisted pinch value applies
+    # from frame one, not only after a slider nudge.
+    tuning = tuning_from_prefill(prefill)
+    confidence = confidence_from_prefill(prefill)
 
-    tracker, detectors, scene, interaction = _init_mode(args)
+    tracker, detectors, scene, interaction = _init_mode(args, tuning, confidence)
     preview = PreviewSink(WINDOW_NAME)
     virtualcam = VirtualCamSink()
     webcam = ThreadedSource(WebcamSource())
@@ -648,6 +639,7 @@ def run(args: argparse.Namespace) -> None:
         runtime = PipelineRuntime(
             args, webcam, worker, scene, interaction, preview, virtualcam,
             virtualcam_active=prefill["virtualcam"],
+            tuning=tuning,
         )
         if not args.no_panel:
             panel = _build_panel(runtime, prefill)
@@ -678,7 +670,13 @@ def run(args: argparse.Namespace) -> None:
         # the panel's live field values; fall back to the launch args when the
         # panel was off (--no-panel) or never built. save_config never raises.
         vcam_state = runtime.virtualcam_active if runtime is not None else args.virtualcam
-        config.save_config(config.CONFIG_FILENAME, _final_settings(panel, args, vcam_state))
+        # Persist the runtime-authoritative pinch tuning (the sliders drove it)
+        # and the startup-only confidences so both round-trip next launch.
+        tuning_state = runtime.tuning if runtime is not None else tuning
+        config.save_config(
+            config.CONFIG_FILENAME,
+            _final_settings(panel, args, vcam_state, tuning_state, confidence),
+        )
         if panel is not None:
             panel.close()
         # Release any layer sources (stops live window/screen capture threads; a

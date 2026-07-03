@@ -10,6 +10,7 @@ from math import hypot
 from typing import Optional, Tuple
 
 from src.hand_tracker import Hand
+from src.tuning import DEFAULT_PINCH_ENTER, DEFAULT_PINCH_EXIT
 
 # Landmark indices (MediaPipe hand topology).
 WRIST = 0
@@ -37,27 +38,37 @@ _MIN_CURLED_FINGERS_FOR_GRAB = 3
 # threshold) before it releases. That gap is what stops rapid PINCH/OPEN
 # flicker when your fingers hover right at the boundary.
 #
-# HOW TO TUNE (edit only the two numbers below):
+# HOW TO TUNE:
+#   - LIVE: the control panel has two sliders (pinch ENTER / pinch EXIT) that
+#     retune tracking on the fly -- moving one publishes a ``GestureTuning``
+#     snapshot to the tracking thread, which swaps the thresholds onto the
+#     detectors it owns (see ``GestureDetector.set_thresholds`` +
+#     ``src.tracking.TrackingWorker.set_tuning``). The slider values persist to
+#     ``handy_config.json`` (keys ``pinch_enter`` / ``pinch_exit``) and pre-fill
+#     the sliders next launch. Use the sliders to dial these in interactively.
+#   - The two numbers below are only the built-in DEFAULTS (re-exported from
+#     ``src.tuning``) used before any slider move / persisted config. Guidance:
 #   - Pinch triggers too EARLY (fires before your fingers actually touch):
-#     lower PINCH_ENTER_THRESHOLD.
+#     lower the ENTER threshold.
 #   - Pinch triggers too LATE (you have to press fingers hard together
-#     before it registers): raise PINCH_ENTER_THRESHOLD.
+#     before it registers): raise the ENTER threshold.
 #   - Gesture FLICKERS between PINCH and OPEN while held steady: widen the
-#     enter/exit gap -- raise PINCH_EXIT_THRESHOLD and/or lower
-#     PINCH_ENTER_THRESHOLD. A wider gap absorbs small hand tremor near the
-#     boundary instead of it crossing back over a single threshold.
-#   - Pinch releases too EAGERLY on small movement while held: raise
-#     PINCH_EXIT_THRESHOLD so it tolerates more drift before letting go.
-#   - Always keep PINCH_EXIT_THRESHOLD > PINCH_ENTER_THRESHOLD; if they're
-#     equal (or inverted) hysteresis has no effect and flicker comes back.
+#     enter/exit gap -- raise EXIT and/or lower ENTER. A wider gap absorbs
+#     small hand tremor near the boundary instead of it crossing back over a
+#     single threshold.
+#   - Pinch releases too EAGERLY on small movement while held: raise the EXIT
+#     threshold so it tolerates more drift before letting go.
+#   - EXIT must stay strictly above ENTER or hysteresis has no effect and
+#     flicker comes back; ``src.tuning.clamp_tuning`` enforces a minimum gap on
+#     BOTH the slider and the config-load path so an inverted pair can't slip in.
 #   - These are normalized distances (fraction of the frame, not pixels), so
 #     they scale with hand distance from the camera automatically -- tune at
 #     your typical demo distance from the webcam.
 #
 # Tuned by eye against typical index-thumb spacing at arm's length from a
 # webcam.
-PINCH_ENTER_THRESHOLD = 0.05
-PINCH_EXIT_THRESHOLD = 0.07
+PINCH_ENTER_THRESHOLD = DEFAULT_PINCH_ENTER
+PINCH_EXIT_THRESHOLD = DEFAULT_PINCH_EXIT
 
 Point2D = Tuple[float, float]
 
@@ -115,10 +126,34 @@ class GestureDetector:
 
     Single-hand MVP: one instance is enough. Call ``update`` once per frame
     with the current hand's landmarks (or ``None`` if no hand was detected).
+
+    The enter/exit pinch thresholds are per-instance (defaulting to the module
+    constants) so live panel tuning can retune detection: the owning tracking
+    thread calls ``set_thresholds`` with the latest ``GestureTuning`` between
+    frames. The hysteresis latch (``_is_pinching``) is preserved across a
+    threshold swap -- only the comparison bounds change, so an in-flight pinch
+    isn't dropped just because you nudged a slider.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        enter_threshold: float = PINCH_ENTER_THRESHOLD,
+        exit_threshold: float = PINCH_EXIT_THRESHOLD,
+    ) -> None:
         self._is_pinching = False
+        self._enter_threshold = enter_threshold
+        self._exit_threshold = exit_threshold
+
+    def set_thresholds(self, enter_threshold: float, exit_threshold: float) -> None:
+        """Swap in new pinch thresholds (owning tracking thread only).
+
+        Mutates in place because this detector has a single owner (the tracking
+        thread); the caller passes already-clamped values (see
+        ``src.tuning.clamp_tuning``), so the enter < exit invariant holds. The
+        hysteresis latch is intentionally left untouched.
+        """
+        self._enter_threshold = enter_threshold
+        self._exit_threshold = exit_threshold
 
     def update(self, hand: Optional[Hand]) -> GestureState:
         """Compute this frame's gesture state, applying pinch hysteresis.
@@ -140,9 +175,9 @@ class GestureDetector:
         distance, midpoint = pinch_distance_and_midpoint(hand)
 
         if self._is_pinching:
-            self._is_pinching = distance < PINCH_EXIT_THRESHOLD
+            self._is_pinching = distance < self._exit_threshold
         else:
-            self._is_pinching = distance < PINCH_ENTER_THRESHOLD
+            self._is_pinching = distance < self._enter_threshold
 
         return GestureState(
             is_pinching=self._is_pinching,
