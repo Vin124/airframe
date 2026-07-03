@@ -5,12 +5,14 @@ compositing of scene layers. Pure/headless -- synthetic numpy frames only.
 import numpy as np
 import pytest
 
-from src.compositor import render
+from src.compositor import draw_selection_highlight, render
 from src.scene import Layer, Scene, Transform
 from src.sources.base import Source
 from src.sources.image import ImageSource
 
 FRAME_SIZE = (100, 100)  # (width, height)
+
+_HIGHLIGHT_COLOR = (0, 165, 255)  # must match src.compositor._HIGHLIGHT_COLOR
 
 
 def _solid_image(size=(10, 10), bgr=(200, 160, 80), alpha=255) -> np.ndarray:
@@ -161,3 +163,44 @@ def test_composite_downscaled_layer_shrinks_rect():
     render(frame, Scene.single(layer))
     assert tuple(int(v) for v in frame[50, 50]) == (40, 50, 60)  # inside shrunk rect
     assert tuple(int(v) for v in frame[45, 45]) == (0, 0, 0)     # scale-1.0 pixel now bare
+
+
+# --------------------------------------------------------------------------- #
+# Selection highlight (Phase 8): thin box around the selected layer
+# --------------------------------------------------------------------------- #
+
+class _SizelessSource(Source):
+    """A layer source with no frame yet, so its rect is undefined."""
+
+    def read(self):
+        return None
+
+    @property
+    def base_size(self):
+        return None
+
+
+def test_draw_selection_highlight_marks_selected_layer():
+    frame = _blank_frame((0, 0, 0))
+    original = frame.copy()
+    scene = Scene.single(_layer(bgr=(10, 20, 30)))  # centered 10x10 rect
+    result = draw_selection_highlight(frame, scene)
+    assert result is frame  # same array back (chaining)
+    assert not np.array_equal(frame, original)  # something was drawn
+    # The exact highlight color appears (cv2.rectangle isn't anti-aliased here).
+    assert np.any(np.all(frame == _HIGHLIGHT_COLOR, axis=2))
+
+
+def test_draw_selection_highlight_noop_without_selection():
+    frame = _blank_frame((0, 0, 0))
+    original = frame.copy()
+    draw_selection_highlight(frame, Scene())  # nothing selected
+    assert np.array_equal(frame, original)
+
+
+def test_draw_selection_highlight_noop_when_size_unknown():
+    frame = _blank_frame((0, 0, 0))
+    original = frame.copy()
+    scene = Scene(layers=(Layer(source=_SizelessSource(), selected=True),))
+    draw_selection_highlight(frame, scene)  # base_size None -> no rect -> skip
+    assert np.array_equal(frame, original)

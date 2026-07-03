@@ -11,10 +11,13 @@ dataclasses so the whole thing is testable without a camera:
                         when the two-hand gesture began.
     - ``InteractionState`` : bundles grab + resize; ``step`` advances it one
                         frame from the two hands' gesture states and returns the
-                        updated interaction plus the updated selected ``Layer``.
+                        updated interaction plus the updated ``Scene``.
 
-The layer owns the ``Transform`` (its geometry); this module reads it, advances
-the machines, and writes the new transform back onto the layer. Two-hand resize
+``step`` takes the whole ``Scene``: on a pinch rising edge it selects the
+top-most layer under the pinch point (so you grab whichever overlay is on top
+there), then advances grab/resize on the selected layer and writes it back. The
+layer owns the ``Transform`` (its geometry); this module reads it, advances the
+machines, and writes the new transform back onto the layer. Two-hand resize
 outranks single-hand grab, matching the pre-refactor behavior exactly.
 """
 
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 from math import hypot
 from typing import List, Optional, Protocol, Tuple
 
-from src.scene import DEFAULT_SCALE, Layer, Size, Transform, contains
+from src.scene import DEFAULT_SCALE, Layer, Scene, Size, Transform, contains
 
 Point2D = Tuple[float, float]
 
@@ -149,27 +152,46 @@ def update_resize(
     return resize, transform.with_scale(resize.start_scale * factor)
 
 
-def step(
+def resolve_selection(
+    state: InteractionState,
+    scene: Scene,
+    primary: GestureLike,
+    frame_size: Size,
+) -> Scene:
+    """Pick the layer a fresh pinch grabs: the top-most under the pinch point.
+
+    Runs only on a pinch RISING EDGE and only while idle: a pinch that starts
+    mid-grab / mid-resize can't steal the selection (the active gesture owns it),
+    and a pinch that starts over bare background (no layer under it) leaves the
+    current selection untouched -- the edge is still consumed downstream, so it
+    grabs nothing. Otherwise the top-most containing layer becomes selected, so
+    the very same frame's ``update_grab`` grabs the layer we just picked.
+    """
+    in_gesture = state.grab.is_grabbed or state.resize.is_resizing
+    pinch_started = primary.is_pinching and not state.grab.was_pinching
+    if not pinch_started or in_gesture:
+        return scene
+    hit = scene.top_layer_at(primary.pinch_point, frame_size)
+    if hit is None:
+        return scene
+    return scene.select_layer(hit)
+
+
+def _advance_selected(
     state: InteractionState,
     layer: Layer,
-    gesture_states: List[GestureLike],
+    primary: GestureLike,
+    secondary: GestureLike,
     frame_size: Size,
 ) -> Tuple[InteractionState, Layer]:
-    """Advance interaction one frame over the selected ``layer`` from both hands.
+    """Advance grab/resize on the selected ``layer`` (pre-Phase-8 single-layer body).
 
-    ``gesture_states`` is a length-2 list (slot 0 = primary hand); each item
-    only needs ``.is_pinching`` and ``.pinch_point``. Two-hand resize takes
-    priority over single-hand grab when both hands pinch, so the primary hand's
-    pinch can't fight the resize; grab is idled but its edge memory is kept
-    coherent so ending a resize doesn't spuriously auto-grab.
-
-    Returns the updated ``InteractionState`` and a copy of ``layer`` with its
-    transform advanced.
+    Two-hand resize takes priority over single-hand grab when both hands pinch,
+    so the primary hand's pinch can't fight the resize; grab is idled but its
+    edge memory is kept coherent so ending a resize doesn't spuriously auto-grab.
     """
     transform = layer.transform
     base_size = layer.base_size
-    primary = gesture_states[0]
-    secondary = gesture_states[1]
     both_pinching = bool(primary.is_pinching and secondary.is_pinching)
 
     if both_pinching:
@@ -186,3 +208,39 @@ def step(
         state.grab, transform, base_size, primary.is_pinching, primary.pinch_point, frame_size
     )
     return InteractionState(grab=grab, resize=resize), layer.with_transform(transform)
+
+
+def step(
+    state: InteractionState,
+    scene: Scene,
+    gesture_states: List[GestureLike],
+    frame_size: Size,
+) -> Tuple[InteractionState, Scene]:
+    """Advance interaction one frame over ``scene`` from both hands.
+
+    First resolves selection (``resolve_selection``): a pinch that starts over a
+    layer selects the top-most one under it, so the same frame grabs exactly the
+    layer the hand is on; an in-progress gesture can't be stolen. Then advances
+    grab/resize on the selected layer and writes it back into the scene.
+
+    ``gesture_states`` is a length-2 list (slot 0 = primary hand); each item only
+    needs ``.is_pinching`` and ``.pinch_point``. Tolerates an empty / unselected
+    scene (legal once the last layer is removed at runtime): nothing moves, but
+    the pinch edge memory is still advanced so a later pinch is a clean edge.
+
+    Returns the updated ``InteractionState`` and the updated ``Scene``.
+    """
+    primary = gesture_states[0]
+    secondary = gesture_states[1]
+
+    scene = resolve_selection(state, scene, primary, frame_size)
+
+    layer = scene.selected_layer
+    if layer is None:
+        grab = GrabState(
+            is_grabbed=False, offset=state.grab.offset, was_pinching=primary.is_pinching
+        )
+        return InteractionState(grab=grab, resize=ResizeState()), scene
+
+    new_state, layer = _advance_selected(state, layer, primary, secondary, frame_size)
+    return new_state, scene.replace_selected(layer)

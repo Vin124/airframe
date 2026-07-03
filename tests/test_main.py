@@ -10,9 +10,14 @@ import pytest
 import src.main
 from src.interaction import GrabState, InteractionState, ResizeState
 from src.main import (
+    ADD_IMAGE_KEY,
+    ADD_SCREEN_KEY,
+    ADD_WINDOW_KEY,
+    BRING_TO_FRONT_KEY,
     INITIAL_FIT_FRACTION,
     MODE_IMAGE,
     MODE_SKELETON,
+    REMOVE_LAYER_KEY,
     RESET_TRANSFORM_KEY,
     SCALE_DOWN_KEYS,
     SCALE_UP_KEYS,
@@ -25,6 +30,8 @@ from src.main import (
     _build_layer_source,
     _fit_layer_to_frame,
     _handle_image_key,
+    _handle_layer_keys,
+    _initial_fit_ids,
     _pump_virtualcam,
     _toggle_skeleton,
     _toggle_virtualcam,
@@ -32,7 +39,7 @@ from src.main import (
 )
 from src.scene import Layer, Scene, Transform
 from src.sinks import SinkError
-from src.sources import ImageSource
+from src.sources import ImageSource, SourceError
 from src.sources.base import Size, Source
 
 
@@ -293,36 +300,54 @@ def test_pump_virtualcam_runtime_toggle_failure_is_not_fatal():
 
 def test_apply_pending_fit_not_pending_is_noop():
     scene = _scene()
-    result, pending = _apply_pending_fit(scene, False, (640, 480))
+    result, pending = _apply_pending_fit(scene, set(), (640, 480))
     assert result is scene
-    assert pending is False
+    assert pending == set()
 
 
 def test_apply_pending_fit_stays_pending_until_size_known():
-    scene = Scene.single(Layer(source=_FakeSource(base_size=None)))
-    result, pending = _apply_pending_fit(scene, True, (640, 480))
+    scene = Scene.single(Layer(source=_FakeSource(base_size=None)))  # id 0
+    result, pending = _apply_pending_fit(scene, {0}, (640, 480))
     assert result is scene
-    assert pending is True
+    assert pending == {0}
 
 
 def test_apply_pending_fit_applies_once_then_clears_flag():
-    scene = Scene.single(Layer(source=_FakeSource(base_size=(1600, 900))))
-    fitted_scene, pending = _apply_pending_fit(scene, True, (640, 480))
-    assert pending is False
+    scene = Scene.single(Layer(source=_FakeSource(base_size=(1600, 900))))  # id 0
+    fitted_scene, pending = _apply_pending_fit(scene, {0}, (640, 480))
+    assert pending == set()
     expected = (640 * INITIAL_FIT_FRACTION) / 1600
-    assert fitted_scene.selected_layer.transform.scale == pytest.approx(expected)
-    # A second call with the cleared flag must not re-fit (e.g. after resize).
-    resized = fitted_scene.replace_selected(
-        fitted_scene.selected_layer.with_transform(Transform(scale=3.0))
+    assert fitted_scene.layer_by_id(0).transform.scale == pytest.approx(expected)
+    # A second call with the cleared set must not re-fit (e.g. after resize).
+    resized = fitted_scene.update_layer(
+        0, fitted_scene.layer_by_id(0).with_transform(Transform(scale=3.0))
     )
-    again, pending = _apply_pending_fit(resized, False, (640, 480))
+    again, pending = _apply_pending_fit(resized, set(), (640, 480))
     assert again is resized
-    assert again.selected_layer.transform.scale == pytest.approx(3.0)
+    assert again.layer_by_id(0).transform.scale == pytest.approx(3.0)
 
 
-def test_apply_pending_fit_with_empty_scene_stays_pending():
-    result, pending = _apply_pending_fit(Scene(), True, (640, 480))
-    assert pending is True
+def test_apply_pending_fit_only_fits_pending_ids():
+    # Two live layers, but only id 1 is pending -> id 0 keeps its scale.
+    scene = (
+        Scene()
+        .add_layer(Layer(source=_FakeSource(base_size=(1000, 500))))  # id 0
+        .add_layer(Layer(source=_FakeSource(base_size=(1600, 900))))  # id 1
+    )
+    result, pending = _apply_pending_fit(scene, {1}, (640, 480))
+    assert pending == set()
+    assert result.layer_by_id(0).transform.scale == pytest.approx(1.0)  # untouched
+    expected = (640 * INITIAL_FIT_FRACTION) / 1600
+    assert result.layer_by_id(1).transform.scale == pytest.approx(expected)
+
+
+def test_apply_pending_fit_drops_id_of_removed_layer():
+    # A pending id whose layer is no longer in the scene (removed before its
+    # first frame) is dropped, not carried forever.
+    scene = Scene.single(Layer(source=_FakeSource(base_size=(1600, 900))))  # id 0
+    result, pending = _apply_pending_fit(scene, {99}, (640, 480))
+    assert result is scene
+    assert pending == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -369,3 +394,234 @@ def test_build_layer_source_screen_dispatch(monkeypatch):
     source = _build_layer_source(args)
     assert isinstance(source, _FakeMonitorSource)
     assert created == {"index": 2, "opened": True}
+
+
+# --------------------------------------------------------------------------- #
+# _initial_fit_ids: which launch layers need the one-time fit
+# --------------------------------------------------------------------------- #
+
+def test_initial_fit_ids_empty_for_static_image():
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    assert _initial_fit_ids(args, _scene()) == set()
+
+
+def test_initial_fit_ids_empty_in_skeleton_mode():
+    args = parse_args(["--mode", "skeleton"])
+    assert _initial_fit_ids(args, Scene()) == set()
+
+
+def test_initial_fit_ids_has_launch_layer_for_live_source():
+    args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "1"])
+    scene = Scene().add_layer(Layer(source=_FakeSource(base_size=None)))  # id 0
+    assert _initial_fit_ids(args, scene) == {0}
+
+
+# --------------------------------------------------------------------------- #
+# _handle_layer_keys: add (a/w/m), remove (x), bring-to-front (f)
+# --------------------------------------------------------------------------- #
+
+class _ClosableSource(Source):
+    """A layer source that records whether close() was called (remove tests)."""
+
+    def __init__(self, base_size: Size = (10, 10)) -> None:
+        self._base_size = base_size
+        self.closed = False
+
+    def read(self):
+        return None
+
+    @property
+    def base_size(self):
+        return self._base_size
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeLiveSource:
+    """A duck-typed live layer source (window/screen) for add-layer tests.
+
+    The builders construct it positionally (``WindowSource(title)`` /
+    ``MonitorSource(index)``), so it records the positional args it was built
+    with.
+    """
+
+    def __init__(self, *args) -> None:
+        self.args = args
+
+    def open(self) -> "_FakeLiveSource":
+        return self
+
+    def read(self):
+        return None
+
+    @property
+    def base_size(self):
+        return None  # live sources report no size until their first frame
+
+    def close(self) -> None:
+        pass
+
+
+def test_handle_layer_keys_add_image_adds_selected_top_layer():
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    scene = _scene()  # one layer, id 0, selected
+    new_scene, interaction, fit_ids = _handle_layer_keys(
+        ADD_IMAGE_KEY, args, scene, InteractionState.initial(), set()
+    )
+    assert len(new_scene.layers) == 2
+    added = new_scene.selected_layer
+    assert added.layer_id == 1  # new layer selected
+    assert added.z_index == 1  # lands on top
+    assert isinstance(added.source, ImageSource)
+    assert fit_ids == set()  # image source is not live -> no pending fit
+
+
+def test_handle_layer_keys_add_image_without_path_is_noop(capsys):
+    args = parse_args(["--mode", "image", "--source", "screen"])  # no --image
+    scene = _scene()
+    new_scene, _interaction, fit_ids = _handle_layer_keys(
+        ADD_IMAGE_KEY, args, scene, InteractionState.initial(), set()
+    )
+    assert new_scene is scene  # unchanged
+    assert fit_ids == set()
+    assert "image" in capsys.readouterr().err.lower()
+
+
+def test_handle_layer_keys_add_window_marks_live_fit(monkeypatch):
+    monkeypatch.setattr(src.main, "WindowSource", _FakeLiveSource)
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "Pad"])
+    scene = _scene()
+    new_scene, _interaction, fit_ids = _handle_layer_keys(
+        ADD_WINDOW_KEY, args, scene, InteractionState.initial(), set()
+    )
+    assert len(new_scene.layers) == 2
+    new_id = new_scene.selected_layer.layer_id
+    assert fit_ids == {new_id}  # live source -> pending fit tracked by id
+    assert isinstance(new_scene.selected_layer.source, _FakeLiveSource)
+
+
+def test_handle_layer_keys_add_window_without_title_is_noop(capsys):
+    # --source image at launch means no --window-title was supplied.
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    scene = _scene()
+    new_scene, _interaction, fit_ids = _handle_layer_keys(
+        ADD_WINDOW_KEY, args, scene, InteractionState.initial(), set()
+    )
+    assert new_scene is scene
+    assert "window" in capsys.readouterr().err.lower()
+
+
+def test_handle_layer_keys_add_window_failure_keeps_running(monkeypatch, capsys):
+    class _FailingWindowSource:
+        def __init__(self, title):
+            pass
+
+        def open(self):
+            raise SourceError("Could not capture a window matching title 'X'.")
+
+    monkeypatch.setattr(src.main, "WindowSource", _FailingWindowSource)
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "X"])
+    scene = _scene()
+    new_scene, _interaction, fit_ids = _handle_layer_keys(
+        ADD_WINDOW_KEY, args, scene, InteractionState.initial(), set()
+    )
+    assert new_scene is scene  # add failed -> scene untouched, no exit
+    assert "window" in capsys.readouterr().err.lower()
+
+
+def test_handle_layer_keys_add_screen_dispatch(monkeypatch):
+    monkeypatch.setattr(src.main, "MonitorSource", _FakeLiveSource)
+    args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "2"])
+    scene = _scene()
+    new_scene, _interaction, fit_ids = _handle_layer_keys(
+        ADD_SCREEN_KEY, args, scene, InteractionState.initial(), set()
+    )
+    added = new_scene.selected_layer
+    assert isinstance(added.source, _FakeLiveSource)
+    assert added.source.args == (2,)  # built with --monitor-index
+    assert fit_ids == {added.layer_id}
+
+
+def test_handle_layer_keys_add_resets_interaction():
+    # Adding a layer while a grab is in progress must not leak the grab onto the
+    # freshly-selected new layer.
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    grabbed = InteractionState(
+        grab=GrabState(is_grabbed=True, offset=(0.1, 0.1), was_pinching=True)
+    )
+    _scene_out, interaction, _fit = _handle_layer_keys(
+        ADD_IMAGE_KEY, args, _scene(), grabbed, set()
+    )
+    assert interaction.grab.is_grabbed is False
+
+
+def _layer_with(source, selected=False):
+    return Layer(source=source, selected=selected)
+
+
+def test_handle_layer_keys_remove_closes_source_and_selects_new_top():
+    src0, src1 = _ClosableSource(), _ClosableSource()
+    scene = Scene().add_layer(_layer_with(src0)).add_layer(_layer_with(src1))
+    grabbed = InteractionState(
+        grab=GrabState(is_grabbed=True, offset=(0.1, 0.1), was_pinching=True)
+    )
+    new_scene, interaction, fit_ids = _handle_layer_keys(
+        REMOVE_LAYER_KEY, None, scene, grabbed, {1}
+    )
+    assert src1.closed is True  # removed (selected) layer's source is released
+    assert src0.closed is False  # kept layer untouched
+    assert new_scene.selected_layer.layer_id == 0  # new top-most selected
+    assert interaction.grab.is_grabbed is False  # mid-grab reset
+    assert fit_ids == set()  # freed id dropped from pending
+
+
+def test_handle_layer_keys_remove_last_layer_empties_scene():
+    src0 = _ClosableSource()
+    scene = Scene().add_layer(_layer_with(src0))
+    new_scene, _interaction, _fit = _handle_layer_keys(
+        REMOVE_LAYER_KEY, None, scene, InteractionState.initial(), set()
+    )
+    assert new_scene.layers == ()
+    assert new_scene.selected_layer is None
+    assert src0.closed is True
+
+
+def test_handle_layer_keys_remove_noop_when_nothing_selected():
+    src0 = _ClosableSource()
+    scene = Scene(layers=(_layer_with(src0, selected=False),))
+    new_scene, _interaction, _fit = _handle_layer_keys(
+        REMOVE_LAYER_KEY, None, scene, InteractionState.initial(), set()
+    )
+    assert new_scene is scene
+    assert src0.closed is False
+
+
+def test_handle_layer_keys_bring_to_front_raises_z():
+    scene = Scene().add_layer(_layer_with(_FakeSource())).add_layer(_layer_with(_FakeSource()))
+    scene = scene.select_layer(0)  # select the back layer (id 0, z 0)
+    new_scene, _interaction, _fit = _handle_layer_keys(
+        BRING_TO_FRONT_KEY, None, scene, InteractionState.initial(), set()
+    )
+    assert new_scene.layer_by_id(0).z_index == 2  # max(0, 1) + 1
+    assert new_scene.layers_by_z()[-1].layer_id == 0  # now front-most
+
+
+def test_handle_layer_keys_other_key_is_noop():
+    scene = _scene()
+    interaction = InteractionState.initial()
+    new_scene, new_interaction, fit_ids = _handle_layer_keys(
+        ord("z"), None, scene, interaction, {5}
+    )
+    assert new_scene is scene
+    assert new_interaction is interaction
+    assert fit_ids == {5}
+
+
+def test_fit_layer_preserves_manual_prescale():
+    # Two '+' presses (scale ~1.21) made before the first captured frame must
+    # survive the fit: it multiplies rather than overwrites the manual scale.
+    layer = Layer(source=_FakeSource(base_size=(1600, 900)), transform=Transform(scale=1.21))
+    fitted = _fit_layer_to_frame(layer, (640, 480))
+    expected = ((640 * INITIAL_FIT_FRACTION) / 1600) * 1.21
+    assert fitted.transform.scale == pytest.approx(expected)

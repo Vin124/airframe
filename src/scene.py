@@ -38,6 +38,10 @@ DEFAULT_SCALE = 1.0
 CENTER_MIN = 0.0
 CENTER_MAX = 1.0
 
+# A layer's ``layer_id`` before ``Scene.add_layer`` stamps a real, monotonically
+# increasing one onto it. Handles bare ``Layer(...)`` built outside a scene.
+UNASSIGNED_ID = -1
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -118,14 +122,18 @@ class Layer:
 
     ``transform`` is the geometry (center + scale); ``z_index`` sets paint order
     (higher paints later, i.e. on top); ``selected`` marks the layer that
-    interaction currently drives. Immutable -- the ``with_*`` helpers return
-    updated copies.
+    interaction currently drives. ``layer_id`` is a stable identity assigned by
+    ``Scene.add_layer`` (``UNASSIGNED_ID`` until then) so remove/raise/fit can
+    target a specific layer across the functional copies grab/move produce --
+    tests key off ``layer_id`` rather than fragile object identity. Immutable --
+    the ``with_*`` helpers return updated copies.
     """
 
     source: Source
     transform: Transform = field(default_factory=Transform)
     z_index: int = 0
     selected: bool = False
+    layer_id: int = UNASSIGNED_ID
 
     @property
     def base_size(self) -> Optional[Size]:
@@ -133,7 +141,7 @@ class Layer:
         return self.source.base_size
 
     def with_transform(self, transform: Transform) -> "Layer":
-        """Return a copy with a replaced transform (keeps source/z/selection)."""
+        """Return a copy with a replaced transform (keeps source/z/id/selection)."""
         return replace(self, transform=transform)
 
     def with_selected(self, selected: bool) -> "Layer":
@@ -173,12 +181,16 @@ class Scene:
     """An ordered set of layers painted over the webcam background.
 
     Compositing order is strictly by ``z_index`` (see ``layers_by_z``), not list
-    order, so raising/lowering a layer is just a ``z_index`` change. For Phase 5
-    there is a single selected image layer; the API is shaped so multiple layers
-    (Phase 8) drop in without changes to the compositor or the loop.
+    order, so raising a layer is just a ``z_index`` change. At most one layer is
+    ``selected`` (the one interaction drives); ``select_layer`` / ``top_layer_at``
+    move the selection, ``add_layer`` / ``remove_selected`` / ``raise_selected``
+    edit the set. ``next_id`` is the source of the monotonically increasing
+    ``layer_id`` stamped onto each added layer, so identity survives the
+    functional copies grab/move/resize produce.
     """
 
     layers: Tuple[Layer, ...] = ()
+    next_id: int = 0
 
     def layers_by_z(self) -> Tuple[Layer, ...]:
         """Layers ordered back-to-front (ascending ``z_index``, stable)."""
@@ -192,16 +204,22 @@ class Scene:
                 return layer
         return None
 
+    def layer_by_id(self, layer_id: int) -> Optional[Layer]:
+        """The layer whose ``layer_id`` matches, or ``None`` if none does."""
+        for layer in self.layers:
+            if layer.layer_id == layer_id:
+                return layer
+        return None
+
     def with_layers(self, layers: Tuple[Layer, ...]) -> "Scene":
-        """Return a copy whose layers are replaced wholesale."""
+        """Return a copy whose layers are replaced wholesale (keeps ``next_id``)."""
         return replace(self, layers=tuple(layers))
 
     def replace_selected(self, new_layer: Layer) -> "Scene":
         """Return a copy with the selected layer swapped for ``new_layer``.
 
-        No-op (returns a copy of the same layers) when nothing is selected.
-        Only the first selected layer is replaced -- exactly one is selected in
-        this phase.
+        No-op (returns ``self``) when nothing is selected. Only the first
+        selected layer is replaced -- at most one is selected at a time.
         """
         for i, layer in enumerate(self.layers):
             if layer.selected:
@@ -209,11 +227,101 @@ class Scene:
                 return replace(self, layers=layers)
         return self
 
+    def update_layer(self, layer_id: int, new_layer: Layer) -> "Scene":
+        """Return a copy with the layer identified by ``layer_id`` replaced.
+
+        No-op (returns a copy of the same layers) when no layer has that id.
+        Used to update a layer that isn't necessarily the selected one (e.g. a
+        just-added live layer getting its one-time initial fit).
+        """
+        layers = tuple(
+            new_layer if layer.layer_id == layer_id else layer for layer in self.layers
+        )
+        return replace(self, layers=layers)
+
+    def select_layer(self, index: int) -> "Scene":
+        """Return a copy with exactly the layer at list ``index`` selected.
+
+        Every other layer is deselected, preserving the at-most-one-selected
+        invariant. An out-of-range ``index`` simply deselects everything.
+        """
+        layers = tuple(
+            layer.with_selected(i == index) for i, layer in enumerate(self.layers)
+        )
+        return replace(self, layers=layers)
+
+    def top_layer_at(self, point: Point2D, frame_size: Size) -> Optional[int]:
+        """List index of the top-most layer whose rect contains ``point``.
+
+        "Top-most" is the layer painted last at that spot: highest ``z_index``,
+        ties broken by later list position (matching ``layers_by_z``'s stable
+        sort, where an equal-z layer later in the list paints on top). Returns
+        ``None`` when no layer contains the point (a pinch over bare background).
+        Size-less layers (``base_size`` None) never contain anything.
+        """
+        top_index: Optional[int] = None
+        top_key: Optional[Tuple[int, int]] = None
+        for i, layer in enumerate(self.layers):
+            if layer.contains(point, frame_size):
+                key = (layer.z_index, i)
+                if top_key is None or key > top_key:
+                    top_key, top_index = key, i
+        return top_index
+
+    def add_layer(self, layer: Layer) -> "Scene":
+        """Return a copy with ``layer`` added on top, selected, and given an id.
+
+        The new layer is stamped with a fresh monotonic ``layer_id`` (from
+        ``next_id``), placed at ``z_index = max(existing) + 1`` (front-most), and
+        marked selected while every existing layer is deselected. Its source and
+        transform are kept; its incoming ``z_index`` / ``selected`` / ``layer_id``
+        are overwritten by this placement.
+        """
+        top_z = max((existing.z_index for existing in self.layers), default=-1)
+        placed = replace(layer, layer_id=self.next_id, z_index=top_z + 1, selected=True)
+        deselected = tuple(existing.with_selected(False) for existing in self.layers)
+        return replace(self, layers=deselected + (placed,), next_id=self.next_id + 1)
+
+    def remove_selected(self) -> "Scene":
+        """Return a copy with the selected layer removed, then re-select the top.
+
+        No-op (returns ``self``) when nothing is selected. After removal the new
+        top-most remaining layer becomes selected; removing the last layer leaves
+        an empty, selection-less scene (legal at runtime). ``next_id`` is kept so
+        ids never repeat even after removals.
+        """
+        kept = tuple(layer for layer in self.layers if not layer.selected)
+        if len(kept) == len(self.layers):
+            return self
+        return replace(self, layers=kept)._select_top()
+
+    def raise_selected(self) -> "Scene":
+        """Return a copy with the selected layer's ``z_index`` above all others.
+
+        No-op (returns ``self``) when nothing is selected. Sets the selected
+        layer's ``z_index`` to ``max(all) + 1`` so it paints last (front-most).
+        """
+        layer = self.selected_layer
+        if layer is None:
+            return self
+        top_z = max(existing.z_index for existing in self.layers)
+        return self.replace_selected(layer.with_z_index(top_z + 1))
+
+    def _select_top(self) -> "Scene":
+        """Select the front-most layer (highest ``z_index``, then list order)."""
+        if not self.layers:
+            return self
+        top_index = max(
+            range(len(self.layers)),
+            key=lambda i: (self.layers[i].z_index, i),
+        )
+        return self.select_layer(top_index)
+
     @classmethod
     def single(cls, layer: Layer) -> "Scene":
-        """Build a one-layer scene with ``layer`` marked selected.
+        """Build a one-layer scene with ``layer`` added, selected, and id-stamped.
 
-        Convenience for the Phase 5 single-image scene; multi-layer scenes use
-        ``with_layers`` / ``replace_selected`` directly.
+        Convenience for the launch-time single-layer scene; runtime multi-layer
+        edits go through ``add_layer`` / ``remove_selected`` directly.
         """
-        return cls(layers=(layer.with_selected(True),))
+        return cls().add_layer(layer)

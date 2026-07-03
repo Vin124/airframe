@@ -12,7 +12,11 @@ python -m src.main --mode image --image assets/test.png   # + pinch-to-grab imag
 python -m src.main --mode image --source window --window-title "Notepad"  # grab a live window
 python -m src.main --mode image --source screen --monitor-index 1         # grab a monitor (1-based)
 ```
-Quit with `q`.
+Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
+`v` toggle virtual cam. Image-mode multi-layer: `a`/`w`/`m` add an image / window
+/ screen layer (reusing the launch args), `x` remove the selected layer, `f`
+bring it to the front. A pinch grabs the top-most layer under the pinch point;
+the selected layer is outlined.
 
 ## Structure
 Pipeline: webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**.
@@ -29,9 +33,9 @@ src/sources/          # frame producers (Source contract) -> latest frame as num
     webcam.py         #   WebcamSource: live feed, applies the selfie mirror
     image.py          #   ImageSource: loaded BGRA overlay image
     capture.py        #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
-src/scene.py          # Transform geometry + Layer (source+transform+z_index+selected) + Scene
-src/compositor.py     # alpha-composite layers onto the webcam frame in place, by z-order
-src/interaction.py    # grab/move/resize state machines over the selected layer
+src/scene.py          # Transform geometry + Layer (source+transform+z_index+selected+layer_id) + Scene (multi-layer add/remove/raise, hit-test selection)
+src/compositor.py     # alpha-composite layers onto the webcam frame in place by z-order + draw the selected-layer highlight
+src/interaction.py    # grab/move/resize state machines; step() resolves top-most selection on pinch start, drives the selected layer
 src/sinks/            # frame consumers (Sink contract)
     base.py           #   Sink ABC + SinkError
     preview.py        #   PreviewSink: cv2.imshow window
@@ -49,4 +53,7 @@ src/sinks/            # frame consumers (Sink contract)
 - Prefer MediaPipe Tasks API (`HandLandmarker`, `hand_landmarker.task`) in VIDEO/LIVE_STREAM mode; fall back to legacy `mp.solutions.hands` only if the installed version makes that simpler.
 - Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+).
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
-- Single hand, single image is fine for the MVP.
+- Multiple overlay layers are supported at runtime (Phase 8): add/remove layers,
+  pinch to grab whichever is under the pinch point, bring-to-front, all live.
+  Selection is single (exactly one active layer); layers carry a stable
+  `layer_id` so remove/raise/fit target a layer across move/resize copies.

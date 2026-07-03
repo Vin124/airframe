@@ -7,20 +7,22 @@ selected layer.
 
 Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
 21-point skeleton and a pinch/grab gesture debug label on the mirrored feed.
-Image mode adds one overlay ``Layer`` you can pinch-grab/move, scale with +/-
-keys, and two-hand-pinch to resize (see ``src.interaction``). Its source is
+Image mode starts with one overlay ``Layer`` you can pinch-grab/move, scale with
++/- keys, and two-hand-pinch to resize (see ``src.interaction``). Its source is
 chosen by ``--source``: a static image (default), a live app ``window`` captured
-by title, or a monitor ``screen`` (Windows Graphics Capture). Both modes mirror
-the feed (in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a
-small HUD (mode/FPS/gesture/key legend), and quit on 'q'. Optionally (``
---virtualcam`` or the 'v' key) the same composited+HUD frame is also broadcast
-to a virtual webcam via ``VirtualCamSink`` so it can be selected as a camera in
-Zoom/Teams/Meet.
+by title, or a monitor ``screen`` (Windows Graphics Capture). At runtime you can
+add more layers ('a'/'w'/'m' for image/window/screen), remove the selected layer
+('x'), and bring it to the front ('f'); a pinch grabs the top-most layer under
+the pinch point, and the selected layer is outlined. Both modes mirror the feed
+(in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a small HUD
+(mode/FPS/gesture/key legend), and quit on 'q'. Optionally (``--virtualcam`` or
+the 'v' key) the same composited+HUD frame is also broadcast to a virtual webcam
+via ``VirtualCamSink`` so it can be selected as a camera in Zoom/Teams/Meet.
 """
 
 import argparse
 import sys
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import cv2
 
@@ -30,7 +32,7 @@ from src.fps import FpsCounter
 from src.gestures import GestureDetector, GestureState
 from src.hand_tracker import HandTracker, HandTrackerError
 from src.interaction import InteractionState, step
-from src.scene import Layer, Scene, Transform
+from src.scene import DEFAULT_SCALE, Layer, Scene, Transform
 from src.sinks import PreviewSink, SinkError, VirtualCamSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
 from src.sources import (
@@ -86,6 +88,17 @@ SCALE_DOWN_KEYS = (ord("-"), ord("_"))
 TOGGLE_SKELETON_KEY = ord("s")
 RESET_TRANSFORM_KEY = ord("r")
 TOGGLE_VIRTUALCAM_KEY = ord("v")
+
+# Image-mode multi-layer keys (Phase 8). 'a'/'w'/'m' add an image / window /
+# screen layer, reusing the launch args (--image / --window-title /
+# --monitor-index) for the new source; each new layer lands on top and becomes
+# selected. 'x' removes the selected layer (selecting the new top-most); 'f'
+# brings the selected layer to the front. Chosen to avoid the keys above.
+ADD_IMAGE_KEY = ord("a")
+ADD_WINDOW_KEY = ord("w")
+ADD_SCREEN_KEY = ord("m")
+REMOVE_LAYER_KEY = ord("x")
+BRING_TO_FRONT_KEY = ord("f")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -252,25 +265,160 @@ def _build_layer_source(args: argparse.Namespace) -> Source:
 
 
 def _apply_pending_fit(
-    scene: Scene, fit_pending: bool, frame_size: Tuple[int, int]
-) -> Tuple[Scene, bool]:
-    """Apply the one-time initial fit of a live layer once its size is known.
+    scene: Scene, fit_ids: Set[int], frame_size: Tuple[int, int]
+) -> Tuple[Scene, Set[int]]:
+    """Apply the one-time initial fit of each pending live layer once sized.
 
-    Returns the (possibly updated) scene and the new ``fit_pending`` flag.
-    No-op when no fit is pending or nothing is selected; when the selected
-    layer's size isn't known yet (no captured frame so far) the fit stays
-    pending and is retried next frame. Extracted from the loop so the
-    exactly-once semantics are unit-testable without a camera.
+    ``fit_ids`` is the set of ``layer_id``s still awaiting their initial fit
+    (a live window/screen layer reports no size until its first captured frame
+    arrives). Returns the (possibly updated) scene and the remaining pending
+    set. A layer whose size is now known is fitted and dropped from the set; one
+    whose size is still unknown stays pending and is retried next frame; one no
+    longer in the scene (removed before its first frame) is dropped. Tracking by
+    id -- not "the selected layer" -- means a layer added then deselected still
+    gets fitted. Extracted from the loop so the exactly-once semantics are
+    unit-testable without a camera.
     """
-    if not fit_pending:
-        return scene, False
+    if not fit_ids:
+        return scene, fit_ids
+    remaining = set(fit_ids)
+    for layer_id in fit_ids:
+        layer = scene.layer_by_id(layer_id)
+        if layer is None:
+            remaining.discard(layer_id)
+            continue
+        fitted = _fit_layer_to_frame(layer, frame_size)
+        if fitted is None:
+            continue
+        scene = scene.update_layer(layer_id, fitted)
+        remaining.discard(layer_id)
+    return scene, remaining
+
+
+def _initial_fit_ids(args: argparse.Namespace, scene: Scene) -> Set[int]:
+    """Layer ids needing a one-time initial fit at launch (live sources only).
+
+    A launch-time live window/screen layer reports no size until its first frame,
+    so it is fitted lazily in the loop; a static image layer already knows its
+    size and keeps the historical scale-1.0 behavior (no fit pending).
+    """
+    if args.mode != MODE_IMAGE or args.source not in LIVE_SOURCES:
+        return set()
+    return {layer.layer_id for layer in scene.layers}
+
+
+def _build_image_layer_source(args: argparse.Namespace) -> Source:
+    """Build an image overlay source for the 'a' key, reusing ``--image``.
+
+    Raises ``SourceError`` when no ``--image`` path was provided (so the caller
+    can print a notice and keep running) or when the path can't be loaded.
+    """
+    if not args.image:
+        raise SourceError(
+            "Cannot add an image layer: no --image path was provided at launch."
+        )
+    return ImageSource.load(args.image)
+
+
+def _build_window_layer_source(args: argparse.Namespace) -> Source:
+    """Build a live window source for the 'w' key, reusing ``--window-title``.
+
+    Raises ``SourceError`` when no ``--window-title`` was provided, or (from
+    ``open()``) when no visible window matches it.
+    """
+    if not args.window_title:
+        raise SourceError(
+            "Cannot add a window layer: no --window-title was provided at launch."
+        )
+    return WindowSource(args.window_title).open()
+
+
+def _build_monitor_layer_source(args: argparse.Namespace) -> Source:
+    """Build a live monitor source for the 'm' key, reusing ``--monitor-index``.
+
+    Raises ``SourceError`` (from ``open()``) on a bad monitor index.
+    """
+    return MonitorSource(args.monitor_index).open()
+
+
+# Dispatch for the add-layer keys: key -> (source builder, is-live-source). Live
+# sources need a lazy initial fit; image sources already know their size.
+_ADD_LAYER_BUILDERS = {
+    ADD_IMAGE_KEY: (_build_image_layer_source, False),
+    ADD_WINDOW_KEY: (_build_window_layer_source, True),
+    ADD_SCREEN_KEY: (_build_monitor_layer_source, True),
+}
+
+
+def _add_layer(
+    scene: Scene,
+    interaction: InteractionState,
+    fit_ids: Set[int],
+    build_source: Callable[[], Source],
+    live: bool,
+) -> Tuple[Scene, InteractionState, Set[int]]:
+    """Add a new top-most, selected layer from ``build_source``; degrade on failure.
+
+    A ``SourceError`` (missing arg, or a window that can't be found) is caught,
+    printed to stderr, and the scene is left unchanged -- adding a layer is a
+    runtime action, so a failure must NOT exit (same principle as the virtual-cam
+    'v' toggle). On success the new layer is selected and interaction is reset to
+    idle so an in-progress grab on the previously-selected layer can't leak onto
+    the new one; a live layer's id joins ``fit_ids`` for its one-time fit.
+    """
+    try:
+        source = build_source()
+    except SourceError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return scene, interaction, fit_ids
+    scene = scene.add_layer(Layer(source=source))
+    if live:
+        fit_ids = fit_ids | {scene.selected_layer.layer_id}
+    return scene, InteractionState.initial(), fit_ids
+
+
+def _remove_selected_layer(
+    scene: Scene, interaction: InteractionState, fit_ids: Set[int]
+) -> Tuple[Scene, InteractionState, Set[int]]:
+    """Remove the selected layer, close its source, and reset interaction.
+
+    No-op (returns the inputs) when nothing is selected. The removed layer's
+    source is per-layer, so it's ``close()``d here (stops a live capture thread;
+    a no-op for an image). Interaction is reset to idle so a grab in progress on
+    the removed layer doesn't leak onto the newly-selected top-most layer;
+    ``remove_selected`` selects that new top (or leaves an empty scene if it was
+    the last layer). The freed id drops out of ``fit_ids``.
+    """
     layer = scene.selected_layer
     if layer is None:
-        return scene, fit_pending
-    fitted = _fit_layer_to_frame(layer, frame_size)
-    if fitted is None:
-        return scene, True
-    return scene.replace_selected(fitted), False
+        return scene, interaction, fit_ids
+    layer.source.close()
+    fit_ids = fit_ids - {layer.layer_id}
+    return scene.remove_selected(), InteractionState.initial(), fit_ids
+
+
+def _handle_layer_keys(
+    key: int,
+    args: argparse.Namespace,
+    scene: Scene,
+    interaction: InteractionState,
+    fit_ids: Set[int],
+) -> Tuple[Scene, InteractionState, Set[int]]:
+    """Apply the image-mode multi-layer keys: add (a/w/m), remove (x), front (f).
+
+    Returns the (possibly updated) ``(scene, interaction, fit_ids)``. Any other
+    key is a no-op. Kept out of ``run`` so the multi-layer transitions are
+    unit-testable without a camera or a real capture source.
+    """
+    builder = _ADD_LAYER_BUILDERS.get(key)
+    if builder is not None:
+        build_source, live = builder
+        return _add_layer(scene, interaction, fit_ids, lambda: build_source(args), live)
+    if key == REMOVE_LAYER_KEY:
+        return _remove_selected_layer(scene, interaction, fit_ids)
+    if key == BRING_TO_FRONT_KEY:
+        return scene.raise_selected(), interaction, fit_ids
+    return scene, interaction, fit_ids
 
 
 def _fit_layer_to_frame(layer: Layer, frame_size: Tuple[int, int]) -> Optional[Layer]:
@@ -279,6 +427,11 @@ def _fit_layer_to_frame(layer: Layer, frame_size: Tuple[int, int]) -> Optional[L
     Returns ``None`` when the layer's size isn't known yet (a live capture
     source reports no size until its first frame arrives) so the caller can try
     again next frame. Only the scale changes; the center is left at the default.
+
+    The fit multiplies into the layer's current scale (relative to
+    ``DEFAULT_SCALE``) rather than overwriting it, so '+'/'-' presses made
+    while the capture was still warming up survive the fit landing instead of
+    being silently discarded.
     """
     base = layer.base_size
     if base is None:
@@ -287,8 +440,9 @@ def _fit_layer_to_frame(layer: Layer, frame_size: Tuple[int, int]) -> Optional[L
     if base_w <= 0:
         return None
     frame_w, _ = frame_size
-    target_scale = (frame_w * INITIAL_FIT_FRACTION) / base_w
-    return layer.with_transform(layer.transform.with_scale(target_scale))
+    fit_scale = (frame_w * INITIAL_FIT_FRACTION) / base_w
+    manual_ratio = layer.transform.scale / DEFAULT_SCALE
+    return layer.with_transform(layer.transform.with_scale(fit_scale * manual_ratio))
 
 
 def _init_mode(args: argparse.Namespace):
@@ -348,9 +502,9 @@ def run(args: argparse.Namespace) -> None:
 
     # Live window/screen layers report no size until their first frame arrives,
     # so their initial fit is applied lazily in the loop (once) rather than at
-    # construction. Static image layers already know their size and keep the
-    # historical scale-1.0 behavior, so no fit is pending for them.
-    fit_pending = args.mode == MODE_IMAGE and args.source in LIVE_SOURCES
+    # construction, tracked per-layer by id. Static image layers already know
+    # their size and keep the historical scale-1.0 behavior (no fit pending).
+    fit_ids = _initial_fit_ids(args, scene)
 
     try:
         with WebcamSource() as webcam:
@@ -371,17 +525,13 @@ def run(args: argparse.Namespace) -> None:
 
                 if args.mode == MODE_IMAGE:
                     frame_size = (frame.shape[1], frame.shape[0])
-                    # One-time initial fit of a live layer, retried until its
-                    # first captured frame provides a size. Runs BEFORE step()
-                    # so grab/move/resize act on the fitted layer from the start.
-                    scene, fit_pending = _apply_pending_fit(scene, fit_pending, frame_size)
-                    # Image mode always keeps exactly one layer selected; the
-                    # guard makes that invariant explicit rather than crashing
-                    # inside step() if it's ever broken.
-                    layer = scene.selected_layer
-                    if layer is not None:
-                        interaction, layer = step(interaction, layer, gesture_states, frame_size)
-                        scene = scene.replace_selected(layer)
+                    # One-time initial fit of each pending live layer, retried
+                    # until its first captured frame provides a size. Runs BEFORE
+                    # step() so grab/move/resize act on the fitted layer from the
+                    # start. step() resolves selection + advances the active
+                    # layer; it tolerates an empty scene (last layer removed).
+                    scene, fit_ids = _apply_pending_fit(scene, fit_ids, frame_size)
+                    interaction, scene = step(interaction, scene, gesture_states, frame_size)
                     status = hud.resize_or_grab_status(
                         interaction.grab.is_grabbed, interaction.resize.is_resizing
                     )
@@ -389,8 +539,10 @@ def run(args: argparse.Namespace) -> None:
                     status = None
 
                 # Composite the scene over the webcam background (empty scene in
-                # skeleton mode = no-op), then draw debug overlays on top.
+                # skeleton mode = no-op), outline the selected layer, then draw
+                # debug overlays on top.
                 compositor.render(frame, scene)
+                compositor.draw_selection_highlight(frame, scene)
                 if show_skeleton:
                     _draw_debug(frame, hands, gesture_state)
 
@@ -426,6 +578,9 @@ def run(args: argparse.Namespace) -> None:
                 virtualcam_active = _toggle_virtualcam(key, virtualcam_active)
                 if args.mode == MODE_IMAGE:
                     scene, interaction = _handle_image_key(key, scene, interaction)
+                    scene, interaction, fit_ids = _handle_layer_keys(
+                        key, args, scene, interaction, fit_ids
+                    )
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

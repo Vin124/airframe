@@ -38,7 +38,15 @@ STATUS_RESIZING = "RESIZING"
 VIRTUALCAM_ON = "ON"
 VIRTUALCAM_OFF = "OFF"
 
-KEY_LEGEND = "q quit | s skeleton | r reset | +/- scale | v virtualcam"
+# The key legend is split across two HUD lines: the full single-line version
+# overflows the fixed-width strip (cv2.putText neither wraps nor clips).
+KEY_LEGEND_LINES = (
+    "q quit | s skel | r reset | +/- scale",
+    "v vcam | a/w/m add | f front | x remove",
+)
+# Backward-compatible single-string view (joined), kept for callers/tests that
+# treat the legend as one blob of text.
+KEY_LEGEND = " | ".join(KEY_LEGEND_LINES)
 
 _NO_FPS_TEXT = "--"
 
@@ -100,7 +108,7 @@ def build_hud_lines(
         lines.append(f"Status: {status}")
     if virtualcam_active is not None:
         lines.append(f"VirtualCam: {VIRTUALCAM_ON if virtualcam_active else VIRTUALCAM_OFF}")
-    lines.append(KEY_LEGEND)
+    lines.extend(KEY_LEGEND_LINES)
     return lines
 
 

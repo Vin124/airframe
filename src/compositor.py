@@ -14,7 +14,14 @@ Pixel math (edge clipping + alpha blend) is lifted verbatim from the old
 import cv2
 import numpy as np
 
-from src.scene import Scene, Transform, scaled_size, top_left_px
+from src.scene import Scene, Transform, rect_px, scaled_size, top_left_px
+
+# Thin box drawn around the selected layer AFTER compositing, so the active
+# layer is obvious when several overlap. Orange (BGR) reads as a distinct
+# "selection" accent against the red skeleton dots / green connections / yellow
+# pinch dot; kept thin (2 px) so it frames without covering the layer.
+_HIGHLIGHT_COLOR = (0, 165, 255)
+_HIGHLIGHT_THICKNESS = 2
 
 
 def _alpha_composite(frame: np.ndarray, image_bgra: np.ndarray, transform: Transform) -> None:
@@ -68,3 +75,28 @@ def render(background: np.ndarray, scene: Scene) -> np.ndarray:
             continue
         _alpha_composite(background, image, layer.transform)
     return background
+
+
+def draw_selection_highlight(frame: np.ndarray, scene: Scene) -> np.ndarray:
+    """Outline the selected layer with a thin box, in place, AFTER compositing.
+
+    Drawn after ``render`` so the frame is visible over the layer it marks.
+    A no-op when nothing is selected or the selected layer has no rect yet
+    (its source hasn't produced a frame, so ``base_size`` is ``None``). Returns
+    the same ``frame`` for convenient chaining.
+    """
+    layer = scene.selected_layer
+    if layer is None:
+        return frame
+    # Snapshot base_size ONCE: for a live layer the capture thread can null it
+    # (window closed) between a check and a later re-read, and Layer.rect_px
+    # re-reads it and raises. One read + the module-level rect_px is race-free.
+    base_size = layer.base_size
+    if base_size is None:
+        return frame
+    frame_h, frame_w = frame.shape[:2]
+    x0, y0, w, h = rect_px(layer.transform, base_size, (frame_w, frame_h))
+    cv2.rectangle(
+        frame, (x0, y0), (x0 + w, y0 + h), _HIGHLIGHT_COLOR, _HIGHLIGHT_THICKNESS
+    )
+    return frame

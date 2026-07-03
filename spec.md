@@ -17,7 +17,8 @@ Mode 2 is a superset of mode 1. Build mode 1 first, fully working, then layer mo
 Chunk 2 lifts most of the original exclusions: virtual camera output shipped in
 Phase 6 (`--virtualcam` / 'v' key via pyvirtualcam + OBS Virtual Camera); live
 window/screen capture shipped in Phase 7 (`--source window|screen` via
-windows-capture); multi-layer manipulation follows in Phase 8.
+windows-capture); multi-layer manipulation shipped in Phase 8 (add/remove/raise
+layers at runtime, pinch grabs the top-most layer under the pinch point).
 Still out of scope:
 - iPhone/iPad mirroring
 - Any packaging/installer (Chunk 3)
@@ -55,9 +56,9 @@ shacam-win/
     │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror
     │   ├── image.py        #   ImageSource: loaded BGRA overlay image
     │   └── capture.py      #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
-    ├── scene.py            # Transform geometry + Layer (source+transform+z_index+selected) + Scene
-    ├── compositor.py       # alpha-composite layers onto the webcam frame in place, by z-order
-    ├── interaction.py      # grab/move/resize state machines over the selected layer
+    ├── scene.py            # Transform geometry + Layer (source+transform+z_index+selected+layer_id) + Scene (multi-layer add/remove/raise + hit-test selection)
+    ├── compositor.py       # alpha-composite layers onto the webcam frame in place by z-order + selected-layer highlight
+    ├── interaction.py      # grab/move/resize state machines; step() resolves top-most selection on pinch start, drives the selected layer
     └── sinks/              # frame consumers (Sink contract)
         ├── base.py         #   Sink ABC + SinkError
         ├── preview.py      #   PreviewSink: cv2.imshow window
@@ -72,7 +73,11 @@ python -m src.main --mode image --image assets/test.png
 python -m src.main --mode image --source window --window-title "Notepad"  # live window overlay
 python -m src.main --mode image --source screen --monitor-index 1         # live monitor overlay (1-based)
 ```
-Press `q` to quit. (A runtime key to toggle modes is a nice-to-have, not required.)
+Press `q` to quit. Other runtime keys: `s` toggle skeleton, `r` reset transform,
+`+/-` scale, `v` toggle virtual cam. Image-mode multi-layer keys: `a`/`w`/`m` add
+an image / window / screen layer (reusing the launch args), `x` remove the
+selected layer, `f` bring it to front. (A runtime key to toggle modes is a
+nice-to-have, not required.)
 
 ## Conventions
 - **Keep every increment runnable.** After each subplan the app must launch and show *something* on the webcam. No half-wired states.
