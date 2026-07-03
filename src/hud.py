@@ -81,12 +81,34 @@ def resize_or_grab_status(is_grabbed: bool, is_resizing: bool) -> Optional[str]:
     return None
 
 
+def build_timing_line(
+    capture_ms: float,
+    track_ms: float,
+    composite_ms: float,
+    sink_ms: float,
+    loop_ms: float,
+) -> str:
+    """One compact HUD line of per-stage millisecond timings (Phase 9).
+
+    ``capture_ms`` is the age of the shown webcam frame (threaded-capture
+    staleness, not a blocking read cost); the rest are the tracking thread's last
+    detect, the composite stage, the sink stage, and the whole main-loop
+    iteration. Values are rounded to whole ms and abbreviated so the single line
+    fits the fixed-width HUD strip.
+    """
+    return (
+        f"cap{capture_ms:.0f} trk{track_ms:.0f} cmp{composite_ms:.0f} "
+        f"snk{sink_ms:.0f} lp{loop_ms:.0f}"
+    )
+
+
 def build_hud_lines(
     mode_name: str,
     fps: Optional[float],
     gesture: str,
     status: Optional[str] = None,
     virtualcam_active: Optional[bool] = None,
+    timing_line: Optional[str] = None,
 ) -> List[str]:
     """Compose the HUD's text lines, in top-to-bottom draw order.
 
@@ -96,7 +118,9 @@ def build_hud_lines(
     ``virtualcam_active`` shows the live on/off state of the virtual-camera
     sink (Phase 6); omitted entirely when None (e.g. callers/tests that don't
     care about it), shown as "ON"/"OFF" otherwise so it's always visible
-    whenever the caller tracks the toggle.
+    whenever the caller tracks the toggle. ``timing_line`` is the Phase 9
+    per-stage timing string (from ``build_timing_line``); omitted when None.
+    The key legend always stays the last two lines.
     """
     fps_text = f"{fps:.1f}" if fps is not None else _NO_FPS_TEXT
     lines = [
@@ -108,6 +132,8 @@ def build_hud_lines(
         lines.append(f"Status: {status}")
     if virtualcam_active is not None:
         lines.append(f"VirtualCam: {VIRTUALCAM_ON if virtualcam_active else VIRTUALCAM_OFF}")
+    if timing_line:
+        lines.append(timing_line)
     lines.extend(KEY_LEGEND_LINES)
     return lines
 

@@ -6,13 +6,16 @@ landmark objects are faked and the download path is exercised with a local
 file / a stubbed urlopen.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mediapipe.tasks.python.core.base_options import BaseOptions
 
 from src.hand_tracker import (
     HandTrackerError,
     LANDMARKS_PER_HAND,
+    create_landmarker,
     ensure_model,
     landmarks_to_hands,
 )
@@ -20,6 +23,28 @@ from src.hand_tracker import (
 
 def _fake_landmark(x, y, z):
     return SimpleNamespace(x=x, y=y, z=z)
+
+
+_MODEL = Path("unused.task")
+
+
+def _factory(record, *, fail_gpu=False, fail_all=False):
+    """A landmarker factory recording the delegate of each options it's built with.
+
+    ``fail_gpu`` raises when handed GPU options (simulating no GPU delegate on
+    Windows, the usual case); ``fail_all`` raises for any delegate.
+    """
+
+    def factory(options):
+        delegate = options.base_options.delegate
+        record.append(delegate)
+        if fail_all:
+            raise RuntimeError("no delegate available")
+        if fail_gpu and delegate == BaseOptions.Delegate.GPU:
+            raise RuntimeError("GPU delegate not supported on this platform")
+        return delegate  # stand-in "landmarker" tagged with the delegate it used
+
+    return factory
 
 
 def test_landmarks_to_hands_empty_when_no_hands():
@@ -113,3 +138,41 @@ def test_ensure_model_raises_clear_error_on_network_failure(tmp_path, monkeypatc
 
     with pytest.raises(HandTrackerError):
         ensure_model(model_path=model, url="http://example.invalid/model.task")
+
+
+# --------------------------------------------------------------------------- #
+# create_landmarker: GPU delegate request + CPU fallback (Phase 9)
+# --------------------------------------------------------------------------- #
+
+def test_create_landmarker_cpu_by_default_uses_cpu_delegate():
+    record = []
+    result = create_landmarker(_factory(record), _MODEL, num_hands=1, gpu=False)
+    assert record == [BaseOptions.Delegate.CPU]  # GPU never attempted
+    assert result == BaseOptions.Delegate.CPU
+
+
+def test_create_landmarker_gpu_success_uses_gpu_delegate(capsys):
+    record = []
+    result = create_landmarker(_factory(record), _MODEL, num_hands=1, gpu=True)
+    assert record == [BaseOptions.Delegate.GPU]
+    assert result == BaseOptions.Delegate.GPU
+    assert capsys.readouterr().err == ""  # no fallback notice when GPU works
+
+
+def test_create_landmarker_gpu_failure_falls_back_to_cpu(capsys):
+    record = []
+    result = create_landmarker(
+        _factory(record, fail_gpu=True), _MODEL, num_hands=1, gpu=True
+    )
+    # Tried GPU first, then fell back to CPU.
+    assert record == [BaseOptions.Delegate.GPU, BaseOptions.Delegate.CPU]
+    assert result == BaseOptions.Delegate.CPU
+    err = capsys.readouterr().err
+    assert "GPU delegate unavailable" in err
+    assert "falling back to CPU" in err
+
+
+def test_create_landmarker_cpu_failure_is_fatal():
+    record = []
+    with pytest.raises(HandTrackerError):
+        create_landmarker(_factory(record, fail_all=True), _MODEL, num_hands=1, gpu=False)

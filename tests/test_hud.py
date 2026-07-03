@@ -11,6 +11,7 @@ from src.hud import (
     VIRTUALCAM_OFF,
     VIRTUALCAM_ON,
     build_hud_lines,
+    build_timing_line,
     gesture_label,
     resize_or_grab_status,
 )
@@ -114,3 +115,31 @@ def test_build_hud_lines_virtualcam_and_status_both_present_before_legend():
     assert f"Status: {STATUS_GRABBED}" in lines
     assert f"VirtualCam: {VIRTUALCAM_ON}" in lines
     assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+
+
+# --------------------------------------------------------------------------- #
+# build_timing_line + timing_line param (Phase 9)
+# --------------------------------------------------------------------------- #
+
+def test_build_timing_line_rounds_and_labels_each_stage():
+    line = build_timing_line(
+        capture_ms=48.6, track_ms=41.2, composite_ms=2.7, sink_ms=0.9, loop_ms=33.4
+    )
+    assert line == "cap49 trk41 cmp3 snk1 lp33"
+
+
+def test_build_hud_lines_timing_line_omitted_by_default():
+    lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN)
+    assert not any(line.startswith("cap") for line in lines)
+
+
+def test_build_hud_lines_includes_timing_line_before_legend():
+    timing = build_timing_line(1, 2, 3, 4, 5)
+    lines = build_hud_lines(
+        "image", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=False, timing_line=timing
+    )
+    assert timing in lines
+    # Legend still the last two lines even with the timing line added.
+    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    # Timing line sits just above the legend.
+    assert lines[-3] == timing

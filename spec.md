@@ -22,6 +22,10 @@ layers at runtime, pinch grabs the top-most layer under the pinch point).
 Still out of scope:
 - iPhone/iPad mirroring
 - Any packaging/installer (Chunk 3)
+- A full ONNX Runtime / TensorRT port of the hand model (Chunk 3). Phase 9 adds a
+  best-effort `--gpu` flag that only requests MediaPipe's built-in GPU delegate
+  and cleanly falls back to CPU; porting the model to a dedicated GPU runtime for
+  guaranteed acceleration is deferred.
 
 ## Tech stack
 - **Python 3.11**
@@ -35,6 +39,9 @@ webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**,
 with gesture-driven **interaction** on the selected layer. The MVP scope above
 (two modes, single hand, single image, OpenCV window only) is unchanged — this
 is purely an internal restructure so later features plug in cleanly.
+As of Phase 9 the pipeline stages run on separate threads (see "Threading model"
+below): the webcam capture and the hand tracking each get their own thread, and
+the main loop only composites + displays, paced to a target FPS.
 ```
 shacam-win/
 ├── CLAUDE.md
@@ -44,16 +51,19 @@ shacam-win/
 ├── assets/
 │   └── test.png            # any test image for image mode
 └── src/
-    ├── main.py             # entry point, arg parsing, mode dispatch, main loop (wires the pipeline)
+    ├── main.py             # entry point, arg parsing, mode dispatch, PipelineRuntime (main loop), thread wiring
     ├── camera.py           # low-level webcam open/read/release wrapper
-    ├── hand_tracker.py     # MediaPipe wrapper -> normalized 21-landmark list
+    ├── hand_tracker.py     # MediaPipe wrapper -> normalized 21-landmark list; --gpu delegate + CPU fallback
+    ├── tracking.py         # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
+    ├── timing.py           # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
     ├── skeleton.py         # draw landmarks + connections (debug overlay)
     ├── gestures.py         # pinch / grab detection from landmarks
-    ├── hud.py              # heads-up display text + strip
-    ├── fps.py              # frame-rate counter
+    ├── hud.py              # heads-up display text + strip (incl. per-stage timing line)
+    ├── fps.py              # frame-rate counter (main-loop rate)
     ├── sources/            # frame producers (Source contract) -> latest frame as numpy array
     │   ├── base.py         #   Source ABC + SourceError
-    │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror
+    │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror (blocking read)
+    │   ├── threaded.py     #   ThreadedSource: runs any blocking Source on a capture thread (Phase 9)
     │   ├── image.py        #   ImageSource: loaded BGRA overlay image
     │   └── capture.py      #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
     ├── scene.py            # Transform geometry + Layer (source+transform+z_index+selected+layer_id) + Scene (multi-layer add/remove/raise + hit-test selection)
@@ -65,6 +75,31 @@ shacam-win/
         └── virtualcam.py   #   VirtualCamSink: pyvirtualcam broadcast (OBS backend)
 ```
 
+### Threading model (Phase 9)
+Three threads, each the sole owner of its state; hand-offs are a single atomic
+reference assignment (latest-frame-wins, GIL-safe, no locks):
+- **Capture thread** — `ThreadedSource` wraps the blocking `WebcamSource` read and
+  publishes each frame as an `(seq, frame)` packet. `PipelineRuntime` never blocks
+  on the camera; if no newer frame exists it re-uses the last one. Published
+  frames are READ-ONLY to consumers (the compositor draws on a private copy).
+- **Tracking thread** — `TrackingWorker` owns the `HandTracker` and the
+  `GestureDetector`s (their frame-to-frame pinch hysteresis). It consumes the
+  newest webcam frame (dedup by `seq` so it never re-detects the same pixels),
+  runs detect + gesture update at its own cadence, and publishes an immutable
+  `TrackingResult` (hands, gesture states, per-update `track_ms`). All MediaPipe
+  access is confined to this thread (VIDEO mode requires monotonic timestamps and
+  single-threaded use). A tracker exception is printed once and freezes the last
+  result — the app stays alive rather than dying silently.
+- **Main loop** — `PipelineRuntime` is the single writer of scene/interaction. It
+  reads the two threads' latest published values, composites + draws the HUD +
+  feeds the sinks, and paces itself to `TARGET_FPS` (30) by handing the remaining
+  frame budget to `cv2.waitKey` (which also renders the window and reads keys).
+  The HUD shows per-stage timings (capture age, track, composite, sink, loop).
+
+`PipelineRuntime` lives in `main.py` (rather than its own module) so it can share
+the already-unit-tested loop helpers without a circular import; `run()` is a thin
+setup/teardown shell around it.
+
 ## How to run
 ```bash
 pip install -r requirements.txt
@@ -72,7 +107,12 @@ python -m src.main --mode skeleton
 python -m src.main --mode image --image assets/test.png
 python -m src.main --mode image --source window --window-title "Notepad"  # live window overlay
 python -m src.main --mode image --source screen --monitor-index 1         # live monitor overlay (1-based)
+python -m src.main --mode skeleton --gpu                                   # request GPU delegate (CPU fallback)
 ```
+`--gpu` requests MediaPipe's built-in GPU delegate for the hand model and falls
+back to CPU with a one-line notice when it's unavailable (the expected case for
+MediaPipe's Python wheels on Windows). Any of the flags above combine with
+`--virtualcam` to also broadcast the composited feed.
 Press `q` to quit. Other runtime keys: `s` toggle skeleton, `r` reset transform,
 `+/-` scale, `v` toggle virtual cam. Image-mode multi-layer keys: `a`/`w`/`m` add
 an image / window / screen layer (reusing the launch args), `x` remove the

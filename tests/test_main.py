@@ -5,6 +5,7 @@ Importing src.main does import cv2 at module level, which is fine (no
 webcam/display access happens until run() is called).
 """
 
+import numpy as np
 import pytest
 
 import src.main
@@ -17,6 +18,7 @@ from src.main import (
     INITIAL_FIT_FRACTION,
     MODE_IMAGE,
     MODE_SKELETON,
+    PipelineRuntime,
     REMOVE_LAYER_KEY,
     RESET_TRANSFORM_KEY,
     SCALE_DOWN_KEYS,
@@ -31,6 +33,7 @@ from src.main import (
     _fit_layer_to_frame,
     _handle_image_key,
     _handle_layer_keys,
+    _init_mode,
     _initial_fit_ids,
     _pump_virtualcam,
     _toggle_skeleton,
@@ -99,6 +102,43 @@ def test_virtualcam_flag_defaults_false():
 def test_virtualcam_flag_can_be_enabled():
     args = parse_args(["--mode", "skeleton", "--virtualcam"])
     assert args.virtualcam is True
+
+
+# --------------------------------------------------------------------------- #
+# --gpu flag (Phase 9): parsing + plumbing into the tracker
+# --------------------------------------------------------------------------- #
+
+def test_gpu_flag_defaults_false():
+    assert parse_args(["--mode", "skeleton"]).gpu is False
+
+
+def test_gpu_flag_can_be_enabled():
+    assert parse_args(["--mode", "skeleton", "--gpu"]).gpu is True
+
+
+def test_init_mode_passes_gpu_flag_to_tracker(monkeypatch):
+    created = {}
+
+    class _FakeTracker:
+        def __init__(self, num_hands=1, gpu=False):
+            created["num_hands"] = num_hands
+            created["gpu"] = gpu
+
+    monkeypatch.setattr(src.main, "HandTracker", _FakeTracker)
+    _init_mode(parse_args(["--mode", "skeleton", "--gpu"]))
+    assert created["gpu"] is True
+
+
+def test_init_mode_defaults_gpu_false(monkeypatch):
+    created = {}
+
+    class _FakeTracker:
+        def __init__(self, num_hands=1, gpu=False):
+            created["gpu"] = gpu
+
+    monkeypatch.setattr(src.main, "HandTracker", _FakeTracker)
+    _init_mode(parse_args(["--mode", "skeleton"]))
+    assert created["gpu"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -625,3 +665,53 @@ def test_fit_layer_preserves_manual_prescale():
     fitted = _fit_layer_to_frame(layer, (640, 480))
     expected = ((640 * INITIAL_FIT_FRACTION) / 1600) * 1.21
     assert fitted.transform.scale == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------- #
+# PipelineRuntime._next_frame: copy-every-tick invariant (thread-safety seam)
+# --------------------------------------------------------------------------- #
+
+class _FakePacketWebcam:
+    """Minimal ThreadedSource stand-in: hand-set (seq, frame) packets."""
+
+    def __init__(self):
+        self.packet = None
+
+    def latest_packet(self):
+        return self.packet
+
+
+def _runtime(webcam) -> PipelineRuntime:
+    # Worker/sinks are None: _next_frame touches only the webcam + clean-frame
+    # state, and __init__ merely stores the collaborators.
+    args = parse_args(["--mode", "skeleton"])
+    return PipelineRuntime(args, webcam, None, Scene(), None, None, None)
+
+
+def test_next_frame_none_before_first_packet():
+    assert _runtime(_FakePacketWebcam())._next_frame() is None
+
+
+def test_next_frame_returns_fresh_copy_every_tick():
+    webcam = _FakePacketWebcam()
+    base = np.zeros((4, 4, 3), dtype=np.uint8)
+    webcam.packet = (1, base)
+    runtime = _runtime(webcam)
+    first = runtime._next_frame()
+    second = runtime._next_frame()  # same seq -> same clean frame, NEW copy
+    assert first is not base and second is not base
+    assert first is not second
+    # Mutating a returned copy (the compositor draws in place) must affect
+    # neither the shared published frame nor the next tick's copy.
+    first[:] = 255
+    assert base.sum() == 0
+    assert runtime._next_frame().sum() == 0
+
+
+def test_next_frame_picks_up_new_sequence():
+    webcam = _FakePacketWebcam()
+    webcam.packet = (1, np.zeros((2, 2, 3), dtype=np.uint8))
+    runtime = _runtime(webcam)
+    assert runtime._next_frame().sum() == 0
+    webcam.packet = (2, np.full((2, 2, 3), 7, dtype=np.uint8))
+    assert int(runtime._next_frame().sum()) == 2 * 2 * 3 * 7

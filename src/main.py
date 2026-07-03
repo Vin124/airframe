@@ -22,9 +22,11 @@ via ``VirtualCamSink`` so it can be selected as a camera in Zoom/Teams/Meet.
 
 import argparse
 import sys
-from typing import Callable, List, Optional, Set, Tuple
+import time
+from typing import Callable, Optional, Set, Tuple
 
 import cv2
+import numpy as np
 
 from src import compositor, hud
 from src.camera import CameraError
@@ -40,13 +42,27 @@ from src.sources import (
     MonitorSource,
     Source,
     SourceError,
+    ThreadedSource,
     WebcamSource,
     WindowSource,
 )
+from src.timing import (
+    StageTimer,
+    StageTimings,
+    ema,
+    pace_wait_ms,
+    remaining_sleep_seconds,
+)
+from src.tracking import TrackingResult, TrackingWorker
 
 WINDOW_NAME = "handy"
 QUIT_KEY = "q"
-WAIT_KEY_DELAY_MS = 1
+
+# Main-loop display target. Capture and hand tracking run on their own threads at
+# their natural rates; the loop composites + displays paced to this via a
+# post-work cv2.waitKey (which also renders the window and reads keys). See
+# src.timing.pace_wait_ms and PipelineRuntime._run_frame.
+TARGET_FPS = 30
 
 MODE_SKELETON = "skeleton"
 MODE_IMAGE = "image"
@@ -144,6 +160,15 @@ def parse_args(argv=None) -> argparse.Namespace:
             "camera in Zoom/Teams/Meet."
         ),
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help=(
+            "Request the MediaPipe GPU delegate for hand tracking. Falls back to "
+            "CPU with a one-line notice when it isn't available (the usual case "
+            "for MediaPipe's Python wheels on Windows)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.source in LIVE_SOURCES and args.mode != MODE_IMAGE:
@@ -156,25 +181,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
-def _detect_gestures(
-    tracker: HandTracker, frame, detectors: List[GestureDetector]
-) -> Tuple[list, List[GestureState]]:
-    """Detect hands and feed hand slot ``i`` to ``detectors[i]``.
-
-    Returns ``(hands, gesture_states)`` where ``gesture_states`` is one per
-    detector (slot 0 = primary hand). NOTE: MediaPipe may swap hand order
-    between frames, so a hand can jump detector slots; that's accepted MVP
-    jitter (see CLAUDE.md).
-    """
-    hands = tracker.detect(frame)
-    gesture_states = [
-        detector.update(hands[i] if i < len(hands) else None)
-        for i, detector in enumerate(detectors)
-    ]
-    return hands, gesture_states
-
-
-def _draw_debug(frame, hands, gesture_state: Optional[GestureState]) -> None:
+def _draw_debug(frame: np.ndarray, hands, gesture_state: Optional[GestureState]) -> None:
     """Draw the skeleton and (if a hand is present) the gesture debug label."""
     draw_skeleton(frame, hands)
     if hands and gesture_state is not None:
@@ -458,10 +465,10 @@ def _init_mode(args: argparse.Namespace):
     """
     try:
         if args.mode == MODE_SKELETON:
-            tracker = HandTracker()
+            tracker = HandTracker(gpu=args.gpu)
             return tracker, [GestureDetector()], Scene(), None
 
-        tracker = HandTracker(num_hands=IMAGE_MODE_NUM_HANDS)
+        tracker = HandTracker(num_hands=IMAGE_MODE_NUM_HANDS, gpu=args.gpu)
         detectors = [GestureDetector() for _ in range(IMAGE_MODE_NUM_HANDS)]
         source = _build_layer_source(args)  # last step that can fail
         scene = Scene.single(Layer(source=source, transform=Transform()))
@@ -471,127 +478,280 @@ def _init_mode(args: argparse.Namespace):
         sys.exit(1)
 
 
+class PipelineRuntime:
+    """Owns the per-frame main-loop state and drives one composite/display tick.
+
+    Phase 9 decouples the pipeline into three threads:
+      - a CAPTURE thread (``ThreadedSource`` around the webcam) publishing frames
+        latest-frame-wins,
+      - a TRACKING thread (``TrackingWorker``) detecting hands + advancing gesture
+        hysteresis at its own cadence and publishing results latest-wins,
+      - this MAIN loop, which is the SINGLE WRITER of the scene/interaction and
+        composites + displays paced to ``TARGET_FPS``.
+
+    This object lives on the main thread only. It reads the two threads' latest
+    published values (never mutating their state) and threads the immutable
+    scene/interaction forward each frame. It's split out of ``run`` so the loop
+    body is a handful of small named stages and ``run`` stays a thin
+    setup/teardown shell; the stages are unit-testable with fakes.
+
+    ``show_skeleton`` starts True in skeleton mode and from --debug-skeleton in
+    image mode; 's' flips it live. ``virtualcam_ever_sent`` distinguishes a fatal
+    first-attempt virtual-cam failure from a graceful later one (see
+    ``_pump_virtualcam``). Stage timings are EMA-smoothed and shown one frame late
+    (the snapshot updates after the HUD is drawn).
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        webcam: ThreadedSource,
+        worker: TrackingWorker,
+        scene: Scene,
+        interaction: Optional[InteractionState],
+        preview: PreviewSink,
+        virtualcam: VirtualCamSink,
+    ) -> None:
+        self._args = args
+        self._webcam = webcam
+        self._worker = worker
+        self._preview = preview
+        self._virtualcam = virtualcam
+        self.scene = scene
+        self.interaction = interaction
+        self.show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
+        self.virtualcam_active = args.virtualcam
+        self._virtualcam_ever_sent = False
+        self._fit_ids = _initial_fit_ids(args, scene)
+        self._fps_counter = FpsCounter()
+        self._last_fps: Optional[float] = None
+        self._clean_frame = None  # newest webcam frame (shared, read-only)
+        self._clean_seq = -1
+        self._status: Optional[str] = None
+        self._timings = StageTimings()
+
+    def run(self) -> None:
+        """Loop until 'q' (or the window is closed), pacing each tick to TARGET_FPS."""
+        while self._run_frame():
+            pass
+
+    def _run_frame(self) -> bool:
+        """One main-loop iteration. Returns False to quit.
+
+        Does the frame's work, pumps the window + reads a key with a single
+        ``cv2.waitKey(1)``, then paces to ``TARGET_FPS`` by sleeping the remainder
+        of the budget (a precise ``time.sleep`` -- cv2.waitKey's Windows timer is
+        too coarse to pace accurately). ``loop_ms`` is the work + key-pump time
+        (excludes the pacing sleep); timings are recorded for the NEXT frame's HUD.
+        """
+        frame_start = time.perf_counter()
+        frame = self._next_frame()
+        if frame is None:
+            # No webcam frame yet (threads warming up): pace + poll keys via waitKey.
+            return self._handle_keys(cv2.waitKey(pace_wait_ms(TARGET_FPS, 0.0)) & 0xFF)
+
+        tracking = self._worker.latest()
+        frame_size = (frame.shape[1], frame.shape[0])
+        self._advance_scene(tracking, frame_size)
+        composite_ms = self._composite(frame, tracking)
+        self._update_fps()
+        self._draw_hud(frame, tracking)
+        sink_ms = self._emit(frame)
+
+        key = cv2.waitKey(1) & 0xFF  # render the window + read the key
+        elapsed = time.perf_counter() - frame_start
+        time.sleep(remaining_sleep_seconds(TARGET_FPS, elapsed))
+        self._update_timings(tracking, composite_ms, sink_ms, elapsed * 1000.0)
+        return self._handle_keys(key)
+
+    def _next_frame(self) -> Optional[np.ndarray]:
+        """Return a fresh, mutable compositing copy of the current webcam frame.
+
+        The capture thread publishes each frame as a shared, READ-ONLY array; the
+        compositor draws in place, so we hand back a private per-frame COPY (never
+        mutating the shared frame the tracking thread also reads). A new copy is
+        taken only when the camera has published a new sequence, but a fresh copy
+        of the clean frame is returned every tick so drawings never accumulate.
+        Reuses the last clean frame when no newer one exists (render can repeat a
+        frame so interaction/HUD stay live); returns ``None`` only before the very
+        first frame arrives.
+        """
+        packet = self._webcam.latest_packet()
+        if packet is not None and packet[0] != self._clean_seq:
+            self._clean_seq = packet[0]
+            self._clean_frame = packet[1]  # shared, treated read-only
+        if self._clean_frame is None:
+            return None
+        return self._clean_frame.copy()
+
+    def _advance_scene(self, tracking: TrackingResult, frame_size: Tuple[int, int]) -> None:
+        """Apply the one-time live-layer fit + advance interaction (image mode only).
+
+        Single writer of scene/interaction (main thread). Runs the initial fit
+        BEFORE ``step`` so grab/move/resize act on the fitted layer from the
+        start; ``step`` resolves selection + advances the active layer and
+        tolerates an empty scene. Skeleton mode has no layers, so this only clears
+        the status.
+        """
+        if self._args.mode != MODE_IMAGE:
+            self._status = None
+            return
+        self.scene, self._fit_ids = _apply_pending_fit(self.scene, self._fit_ids, frame_size)
+        self.interaction, self.scene = step(
+            self.interaction, self.scene, list(tracking.gesture_states), frame_size
+        )
+        self._status = hud.resize_or_grab_status(
+            self.interaction.grab.is_grabbed, self.interaction.resize.is_resizing
+        )
+
+    def _composite(self, frame: np.ndarray, tracking: TrackingResult) -> float:
+        """Composite the scene + selection highlight (+ optional skeleton); return ms.
+
+        Empty scene in skeleton mode = a no-op composite; the skeleton + gesture
+        debug label is drawn on top when enabled, using the tracking thread's
+        latest hands/gesture (possibly frozen if tracking crashed).
+        """
+        with StageTimer() as timer:
+            compositor.render(frame, self.scene)
+            compositor.draw_selection_highlight(frame, self.scene)
+            if self.show_skeleton:
+                _draw_debug(frame, list(tracking.hands), self._primary_gesture(tracking))
+        return timer.ms
+
+    def _update_fps(self) -> None:
+        """Tick the FPS counter (loop rate) and print/remember a fresh reading."""
+        fps = self._fps_counter.tick()
+        if fps is not None:
+            print(f"FPS: {fps:.1f}")
+            self._last_fps = fps
+
+    def _draw_hud(self, frame: np.ndarray, tracking: TrackingResult) -> None:
+        """Draw the HUD strip: mode/FPS/gesture/status/vcam + last frame's timings."""
+        gesture_state = self._primary_gesture(tracking)
+        label = hud.gesture_label(
+            is_grab=bool(gesture_state is not None and gesture_state.is_grab),
+            is_pinching=bool(gesture_state is not None and gesture_state.is_pinching),
+            hand_present=bool(tracking.hands),
+        )
+        timing_line = hud.build_timing_line(
+            self._timings.capture_ms,
+            self._timings.track_ms,
+            self._timings.composite_ms,
+            self._timings.sink_ms,
+            self._timings.loop_ms,
+        )
+        hud.draw_hud(
+            frame,
+            hud.build_hud_lines(
+                self._args.mode,
+                self._last_fps,
+                label,
+                self._status,
+                virtualcam_active=self.virtualcam_active,
+                timing_line=timing_line,
+            ),
+        )
+
+    def _emit(self, frame: np.ndarray) -> float:
+        """Feed the composited+HUD frame to the preview + virtual cam; return ms.
+
+        Both sinks get the SAME frame. A fatal first-attempt virtual-cam failure
+        exits; a later failure degrades gracefully (see ``_pump_virtualcam``).
+        """
+        with StageTimer() as timer:
+            self._preview.send(frame)
+            self.virtualcam_active, self._virtualcam_ever_sent = _pump_virtualcam(
+                self._virtualcam,
+                frame,
+                self.virtualcam_active,
+                self._virtualcam_ever_sent,
+                self._args.virtualcam,
+            )
+        return timer.ms
+
+    def _update_timings(
+        self, tracking: TrackingResult, composite_ms: float, sink_ms: float, loop_ms: float
+    ) -> None:
+        """EMA-smooth this frame's per-stage timings for the next frame's HUD."""
+        capture_ms = self._webcam.frame_age_ms() or 0.0
+        prev = self._timings
+        self._timings = StageTimings(
+            capture_ms=ema(prev.capture_ms, capture_ms),
+            track_ms=ema(prev.track_ms, tracking.track_ms),
+            composite_ms=ema(prev.composite_ms, composite_ms),
+            sink_ms=ema(prev.sink_ms, sink_ms),
+            loop_ms=ema(prev.loop_ms, loop_ms),
+        )
+
+    def _handle_keys(self, key: int) -> bool:
+        """Apply runtime keys (quit/toggles/image keys); return False to quit."""
+        if key == ord(QUIT_KEY):
+            return False
+        self.show_skeleton = _toggle_skeleton(key, self.show_skeleton)
+        self.virtualcam_active = _toggle_virtualcam(key, self.virtualcam_active)
+        if self._args.mode == MODE_IMAGE:
+            self.scene, self.interaction = _handle_image_key(key, self.scene, self.interaction)
+            self.scene, self.interaction, self._fit_ids = _handle_layer_keys(
+                key, self._args, self.scene, self.interaction, self._fit_ids
+            )
+        return True
+
+    @staticmethod
+    def _primary_gesture(tracking: TrackingResult) -> Optional[GestureState]:
+        """The primary hand's gesture state (slot 0), or None if none published."""
+        return tracking.gesture_states[0] if tracking.gesture_states else None
+
+
 def run(args: argparse.Namespace) -> None:
-    """Open the webcam and run the capture/composite/display/quit loop.
+    """Wire the threaded pipeline, run it, and tear everything down on exit.
 
-    ``show_skeleton`` starts True in skeleton mode (skeleton is the point of
-    that mode) and from --debug-skeleton in image mode (off by default there);
-    the 's' key flips it at runtime in both modes. ``last_fps`` holds the most
-    recent FpsCounter reading for the HUD, since ``tick()`` only returns a fresh
-    value once per reporting interval and None otherwise.
-
-    ``virtualcam`` is always constructed (cheap; it does nothing until a frame
-    is sent) so ``close()`` in ``finally`` is always safe to call.
-    ``virtualcam_active`` starts from ``--virtualcam`` and flips on the 'v'
-    key. ``virtualcam_ever_sent`` distinguishes a failure on the very first
-    launch-time attempt (fatal -- exit(1), matching ``_init_mode``'s
-    fail-fast-before-real-work behavior) from a failure after it already
-    worked once, or from a runtime ('v' key) toggle that was never requested
-    at launch (both non-fatal: print + turn the toggle back off, keep the
-    session alive).
+    Capture (webcam) and hand tracking each run on their OWN thread publishing
+    latest-frame-wins; this main thread only composites + displays + handles keys,
+    paced to ``TARGET_FPS`` -- so a slow camera or a ~40ms detect no longer stalls
+    render (see ``PipelineRuntime`` / ``src.tracking.TrackingWorker`` /
+    ``src.sources.threaded.ThreadedSource`` for the threading model). The webcam
+    opens synchronously first (fail-fast on CameraError) before its thread starts.
     """
     tracker, detectors, scene, interaction = _init_mode(args)
-
-    show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
-    last_fps: Optional[float] = None
     preview = PreviewSink(WINDOW_NAME)
-
     virtualcam = VirtualCamSink()
-    virtualcam_active = args.virtualcam
-    virtualcam_ever_sent = False
-
-    # Live window/screen layers report no size until their first frame arrives,
-    # so their initial fit is applied lazily in the loop (once) rather than at
-    # construction, tracked per-layer by id. Static image layers already know
-    # their size and keep the historical scale-1.0 behavior (no fit pending).
-    fit_ids = _initial_fit_ids(args, scene)
+    webcam = ThreadedSource(WebcamSource())
+    worker: Optional[TrackingWorker] = None
+    runtime: Optional[PipelineRuntime] = None
 
     try:
-        with WebcamSource() as webcam:
-            fps_counter = FpsCounter()
-            while True:
-                frame = webcam.read()  # already mirrored (selfie view)
-                if frame is None:
-                    print(
-                        "Warning: failed to read frame from webcam (stream ended "
-                        "or camera disconnected). Stopping.",
-                        file=sys.stderr,
-                    )
-                    break
-
-                hands, gesture_states = _detect_gestures(tracker, frame, detectors)
-                gesture_state = gesture_states[0]
-                hand_present = bool(hands)
-
-                if args.mode == MODE_IMAGE:
-                    frame_size = (frame.shape[1], frame.shape[0])
-                    # One-time initial fit of each pending live layer, retried
-                    # until its first captured frame provides a size. Runs BEFORE
-                    # step() so grab/move/resize act on the fitted layer from the
-                    # start. step() resolves selection + advances the active
-                    # layer; it tolerates an empty scene (last layer removed).
-                    scene, fit_ids = _apply_pending_fit(scene, fit_ids, frame_size)
-                    interaction, scene = step(interaction, scene, gesture_states, frame_size)
-                    status = hud.resize_or_grab_status(
-                        interaction.grab.is_grabbed, interaction.resize.is_resizing
-                    )
-                else:
-                    status = None
-
-                # Composite the scene over the webcam background (empty scene in
-                # skeleton mode = no-op), outline the selected layer, then draw
-                # debug overlays on top.
-                compositor.render(frame, scene)
-                compositor.draw_selection_highlight(frame, scene)
-                if show_skeleton:
-                    _draw_debug(frame, hands, gesture_state)
-
-                fps = fps_counter.tick()
-                if fps is not None:
-                    print(f"FPS: {fps:.1f}")
-                    last_fps = fps
-
-                label = hud.gesture_label(
-                    is_grab=bool(gesture_state is not None and gesture_state.is_grab),
-                    is_pinching=bool(gesture_state is not None and gesture_state.is_pinching),
-                    hand_present=hand_present,
-                )
-                hud.draw_hud(
-                    frame,
-                    hud.build_hud_lines(
-                        args.mode, last_fps, label, status, virtualcam_active=virtualcam_active
-                    ),
-                )
-
-                # Both sinks are fed the SAME composited+HUD frame. The HUD is
-                # intentionally visible in the virtual-cam feed for this debug
-                # harness; hiding it there specifically is future polish.
-                preview.send(frame)
-                virtualcam_active, virtualcam_ever_sent = _pump_virtualcam(
-                    virtualcam, frame, virtualcam_active, virtualcam_ever_sent, args.virtualcam
-                )
-
-                key = cv2.waitKey(WAIT_KEY_DELAY_MS) & 0xFF
-                if key == ord(QUIT_KEY):
-                    break
-                show_skeleton = _toggle_skeleton(key, show_skeleton)
-                virtualcam_active = _toggle_virtualcam(key, virtualcam_active)
-                if args.mode == MODE_IMAGE:
-                    scene, interaction = _handle_image_key(key, scene, interaction)
-                    scene, interaction, fit_ids = _handle_layer_keys(
-                        key, args, scene, interaction, fit_ids
-                    )
+        webcam.open()  # opens the camera (fail-fast) then starts the capture thread
+        worker = TrackingWorker(tracker, detectors, webcam.latest_packet)
+        worker.start()
+        runtime = PipelineRuntime(args, webcam, worker, scene, interaction, preview, virtualcam)
+        runtime.run()
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
+        # stop() reports whether the tracking thread really exited; if a native
+        # detect() wedged past the join timeout, freeing the tracker under the
+        # still-running thread risks a native use-after-free, so skip close()
+        # and let process exit reclaim it (same policy as ThreadedSource.close).
+        worker_stopped = worker.stop() if worker is not None else True
+        webcam.close()
         if tracker is not None:
-            tracker.close()
+            if worker_stopped:
+                tracker.close()
+            else:
+                print(
+                    "Warning: tracking thread didn't stop in time; leaving the "
+                    "hand tracker to be reclaimed at process exit.",
+                    file=sys.stderr,
+                )
         preview.close()
         virtualcam.close()
-        # Release any layer sources (stops live window/screen capture threads;
-        # a no-op for image layers). Empty in skeleton mode.
-        for layer in scene.layers:
+        # Release any layer sources (stops live window/screen capture threads; a
+        # no-op for image layers). Use the runtime's final scene so layers added
+        # at runtime are also closed; fall back to the initial scene if the
+        # runtime never got built. Empty in skeleton mode.
+        final_scene = runtime.scene if runtime is not None else scene
+        for layer in final_scene.layers:
             layer.source.close()
 
 
