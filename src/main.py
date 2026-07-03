@@ -23,12 +23,12 @@ via ``VirtualCamSink`` so it can be selected as a camera in Zoom/Teams/Meet.
 import argparse
 import sys
 import time
-from typing import Callable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
-from src import compositor, hud
+from src import compositor, config, hud
 from src.camera import CameraError
 from src.fps import FpsCounter
 from src.gestures import GestureDetector, GestureState
@@ -54,6 +54,11 @@ from src.timing import (
     remaining_sleep_seconds,
 )
 from src.tracking import TrackingResult, TrackingWorker
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
+    from src.panel import ControlPanel
 
 WINDOW_NAME = "handy"
 QUIT_KEY = "q"
@@ -167,6 +172,15 @@ def parse_args(argv=None) -> argparse.Namespace:
             "Request the MediaPipe GPU delegate for hand tracking. Falls back to "
             "CPU with a one-line notice when it isn't available (the usual case "
             "for MediaPipe's Python wheels on Windows)."
+        ),
+    )
+    parser.add_argument(
+        "--no-panel",
+        dest="no_panel",
+        action="store_true",
+        help=(
+            "Run without the Tkinter control panel (hotkeys only). The panel is "
+            "on by default; use this for headless smokes or a keyboard-only run."
         ),
     )
     args = parser.parse_args(argv)
@@ -314,38 +328,55 @@ def _initial_fit_ids(args: argparse.Namespace, scene: Scene) -> Set[int]:
     return {layer.layer_id for layer in scene.layers}
 
 
-def _build_image_layer_source(args: argparse.Namespace) -> Source:
-    """Build an image overlay source for the 'a' key, reusing ``--image``.
+# --------------------------------------------------------------------------- #
+# Layer-source builders. The explicit-value builders below are the single
+# implementation; the hotkey path wraps them to read the launch args, and the
+# panel path passes values from its fields (see PipelineRuntime.add_*_layer).
+# --------------------------------------------------------------------------- #
 
-    Raises ``SourceError`` when no ``--image`` path was provided (so the caller
-    can print a notice and keep running) or when the path can't be loaded.
+def _image_source_from_path(image_path: Optional[str]) -> Source:
+    """Build an image overlay source from an explicit path.
+
+    Raises ``SourceError`` when the path is empty (so the caller can surface a
+    notice and keep running) or when the path can't be loaded.
     """
-    if not args.image:
-        raise SourceError(
-            "Cannot add an image layer: no --image path was provided at launch."
-        )
-    return ImageSource.load(args.image)
+    if not image_path:
+        raise SourceError("Cannot add an image layer: no image path provided.")
+    return ImageSource.load(image_path)
 
 
-def _build_window_layer_source(args: argparse.Namespace) -> Source:
-    """Build a live window source for the 'w' key, reusing ``--window-title``.
+def _window_source_from_title(window_title: Optional[str]) -> Source:
+    """Build a live window source from an explicit title substring.
 
-    Raises ``SourceError`` when no ``--window-title`` was provided, or (from
-    ``open()``) when no visible window matches it.
+    Raises ``SourceError`` when the title is empty, or (from ``open()``) when no
+    visible window matches it.
     """
-    if not args.window_title:
-        raise SourceError(
-            "Cannot add a window layer: no --window-title was provided at launch."
-        )
-    return WindowSource(args.window_title).open()
+    if not window_title:
+        raise SourceError("Cannot add a window layer: no window title provided.")
+    return WindowSource(window_title).open()
 
 
-def _build_monitor_layer_source(args: argparse.Namespace) -> Source:
-    """Build a live monitor source for the 'm' key, reusing ``--monitor-index``.
+def _monitor_source_from_index(monitor_index: int) -> Source:
+    """Build a live monitor source from an explicit 1-based index.
 
     Raises ``SourceError`` (from ``open()``) on a bad monitor index.
     """
-    return MonitorSource(args.monitor_index).open()
+    return MonitorSource(monitor_index).open()
+
+
+def _build_image_layer_source(args: argparse.Namespace) -> Source:
+    """Hotkey ('a') wrapper: build an image source from ``--image``."""
+    return _image_source_from_path(args.image)
+
+
+def _build_window_layer_source(args: argparse.Namespace) -> Source:
+    """Hotkey ('w') wrapper: build a window source from ``--window-title``."""
+    return _window_source_from_title(args.window_title)
+
+
+def _build_monitor_layer_source(args: argparse.Namespace) -> Source:
+    """Hotkey ('m') wrapper: build a monitor source from ``--monitor-index``."""
+    return _monitor_source_from_index(args.monitor_index)
 
 
 # Dispatch for the add-layer keys: key -> (source builder, is-live-source). Live
@@ -357,6 +388,34 @@ _ADD_LAYER_BUILDERS = {
 }
 
 
+def _add_source_layer(
+    scene: Scene,
+    interaction: InteractionState,
+    fit_ids: Set[int],
+    build_source: Callable[[], Source],
+    live: bool,
+) -> Tuple[Scene, InteractionState, Set[int], Optional[str]]:
+    """Core add-layer transition shared by the hotkey and panel paths.
+
+    Returns ``(scene, interaction, fit_ids, status)`` where ``status`` is the
+    ``SourceError`` message on failure (scene unchanged) or ``None`` on success.
+    Deliberately does NOT print or exit -- adding a layer is a runtime action, so
+    the callers decide how to surface ``status`` (stderr for the hotkey; stderr +
+    the panel's status label for the panel). On success the new layer is selected
+    and interaction is reset to idle so an in-progress grab on the previously-
+    selected layer can't leak onto the new one; a live layer's id joins
+    ``fit_ids`` for its one-time fit.
+    """
+    try:
+        source = build_source()
+    except SourceError as exc:
+        return scene, interaction, fit_ids, str(exc)
+    scene = scene.add_layer(Layer(source=source))
+    if live:
+        fit_ids = fit_ids | {scene.selected_layer.layer_id}
+    return scene, InteractionState.initial(), fit_ids, None
+
+
 def _add_layer(
     scene: Scene,
     interaction: InteractionState,
@@ -364,24 +423,23 @@ def _add_layer(
     build_source: Callable[[], Source],
     live: bool,
 ) -> Tuple[Scene, InteractionState, Set[int]]:
-    """Add a new top-most, selected layer from ``build_source``; degrade on failure.
+    """Hotkey add-layer: like ``_add_source_layer`` but prints failures to stderr.
 
-    A ``SourceError`` (missing arg, or a window that can't be found) is caught,
-    printed to stderr, and the scene is left unchanged -- adding a layer is a
-    runtime action, so a failure must NOT exit (same principle as the virtual-cam
-    'v' toggle). On success the new layer is selected and interaction is reset to
-    idle so an in-progress grab on the previously-selected layer can't leak onto
-    the new one; a live layer's id joins ``fit_ids`` for its one-time fit.
+    A ``SourceError`` is printed and the scene is left unchanged (the app keeps
+    running, same principle as the virtual-cam 'v' toggle).
     """
-    try:
-        source = build_source()
-    except SourceError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return scene, interaction, fit_ids
-    scene = scene.add_layer(Layer(source=source))
-    if live:
-        fit_ids = fit_ids | {scene.selected_layer.layer_id}
-    return scene, InteractionState.initial(), fit_ids
+    scene, interaction, fit_ids, error = _add_source_layer(
+        scene, interaction, fit_ids, build_source, live
+    )
+    if error is not None:
+        print(f"Error: {error}", file=sys.stderr)
+    return scene, interaction, fit_ids
+
+
+def _close_layer_sources(layers: Iterable[Layer]) -> None:
+    """``close()`` every layer's source (stops live capture threads; no-op for images)."""
+    for layer in layers:
+        layer.source.close()
 
 
 def _remove_selected_layer(
@@ -399,7 +457,7 @@ def _remove_selected_layer(
     layer = scene.selected_layer
     if layer is None:
         return scene, interaction, fit_ids
-    layer.source.close()
+    _close_layer_sources((layer,))
     fit_ids = fit_ids - {layer.layer_id}
     return scene.remove_selected(), InteractionState.initial(), fit_ids
 
@@ -478,6 +536,59 @@ def _init_mode(args: argparse.Namespace):
         sys.exit(1)
 
 
+def resolve_panel_prefill(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the panel's initial field values with precedence CLI > config > default.
+
+    argparse can't tell an explicitly-passed default from the built-in default,
+    so "CLI wins" is applied as "a non-default CLI value wins"; when a CLI option
+    is left at its built-in default, the remembered ``cfg`` value is used, which
+    itself already defaults (see ``src.config``). Known limitation (accepted for
+    this debug harness): a CLI value equal to the built-in default can't override
+    a persisted config value. ``--virtualcam`` is store_true, so it can only
+    force the cam ON; to keep it OFF you simply don't pass it and config
+    remembers the last state.
+    """
+    source = args.source if args.source != SOURCE_IMAGE else cfg.get("source", SOURCE_IMAGE)
+    monitor_index = (
+        args.monitor_index
+        if args.monitor_index != DEFAULT_MONITOR_INDEX
+        else cfg.get("monitor_index", DEFAULT_MONITOR_INDEX)
+    )
+    return {
+        "source": source,
+        "image_path": args.image or cfg.get("image_path", ""),
+        "window_title": args.window_title or cfg.get("window_title", ""),
+        "monitor_index": monitor_index,
+        "virtualcam": bool(args.virtualcam or cfg.get("virtualcam", False)),
+    }
+
+
+def _config_from_args(args: argparse.Namespace, virtualcam_active: bool) -> Dict[str, Any]:
+    """Build a config dict from the launch args (the ``--no-panel`` persist path)."""
+    return {
+        "source": args.source,
+        "image_path": args.image or "",
+        "window_title": args.window_title or "",
+        "monitor_index": args.monitor_index,
+        "virtualcam": bool(virtualcam_active),
+    }
+
+
+def _final_settings(panel, args: argparse.Namespace, vcam_state: bool) -> Dict[str, Any]:
+    """The settings dict persisted on exit.
+
+    Prefers the panel's live field values, but the RUNTIME's virtual-cam state
+    (``vcam_state``) is authoritative: the panel's checkbox freezes once its
+    window is closed, so a 'v' hotkey flip after that would otherwise persist
+    stale. Falls back to args-derived settings when no panel was built.
+    """
+    if panel is None:
+        return _config_from_args(args, vcam_state)
+    settings = panel.current_settings()
+    settings["virtualcam"] = bool(vcam_state)
+    return settings
+
+
 class PipelineRuntime:
     """Owns the per-frame main-loop state and drives one composite/display tick.
 
@@ -511,6 +622,7 @@ class PipelineRuntime:
         interaction: Optional[InteractionState],
         preview: PreviewSink,
         virtualcam: VirtualCamSink,
+        virtualcam_active: Optional[bool] = None,
     ) -> None:
         self._args = args
         self._webcam = webcam
@@ -520,7 +632,12 @@ class PipelineRuntime:
         self.scene = scene
         self.interaction = interaction
         self.show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
-        self.virtualcam_active = args.virtualcam
+        # Initial virtual-cam state: the resolved CLI-or-config value (see
+        # resolve_panel_prefill). Defaults to the --virtualcam flag when unset so
+        # existing callers/tests keep the old behavior. Note the fatal-on-first-
+        # failure check in _pump_virtualcam still keys off args.virtualcam, so a
+        # config-driven ON is treated like a runtime 'v' toggle (graceful).
+        self.virtualcam_active = args.virtualcam if virtualcam_active is None else virtualcam_active
         self._virtualcam_ever_sent = False
         self._fit_ids = _initial_fit_ids(args, scene)
         self._fps_counter = FpsCounter()
@@ -528,6 +645,8 @@ class PipelineRuntime:
         self._clean_frame = None  # newest webcam frame (shared, read-only)
         self._clean_seq = -1
         self._status: Optional[str] = None
+        self._panel_status: Optional[str] = None  # last panel-action message
+        self._panel = None  # optional Tk ControlPanel, pumped once per tick
         self._timings = StageTimings()
 
     def run(self) -> None:
@@ -548,7 +667,9 @@ class PipelineRuntime:
         frame = self._next_frame()
         if frame is None:
             # No webcam frame yet (threads warming up): pace + poll keys via waitKey.
-            return self._handle_keys(cv2.waitKey(pace_wait_ms(TARGET_FPS, 0.0)) & 0xFF)
+            keep = self._handle_keys(cv2.waitKey(pace_wait_ms(TARGET_FPS, 0.0)) & 0xFF)
+            self._pump_panel()
+            return keep
 
         tracking = self._worker.latest()
         frame_size = (frame.shape[1], frame.shape[0])
@@ -562,7 +683,12 @@ class PipelineRuntime:
         elapsed = time.perf_counter() - frame_start
         time.sleep(remaining_sleep_seconds(TARGET_FPS, elapsed))
         self._update_timings(tracking, composite_ms, sink_ms, elapsed * 1000.0)
-        return self._handle_keys(key)
+        keep = self._handle_keys(key)
+        # Pump the Tk panel last: its button callbacks run inline here on the main
+        # thread and call this runtime's add/reset/toggle methods, so scene edits
+        # land between frames with the main loop still the single writer.
+        self._pump_panel()
+        return keep
 
     def _next_frame(self) -> Optional[np.ndarray]:
         """Return a fresh, mutable compositing copy of the current webcam frame.
@@ -696,10 +822,103 @@ class PipelineRuntime:
             )
         return True
 
+    # -- panel integration (Phase 10) -------------------------------------- #
+    #
+    # These are the control-panel's drive points. They run on the MAIN thread
+    # (from a Tk button callback during _pump_panel), so mutating scene/
+    # interaction here keeps this runtime the single writer -- the exact same
+    # invariant the hotkeys rely on, with no duplicated transition logic (add
+    # reuses _add_source_layer; remove/reset reuse _close_layer_sources).
+
+    def set_panel(self, panel: Optional["ControlPanel"]) -> None:
+        """Attach the Tk control panel to pump each tick (None = hotkeys only)."""
+        self._panel = panel
+
+    def _pump_panel(self) -> None:
+        """Pump the attached panel once (no-op when there's none / it's closed)."""
+        if self._panel is not None:
+            self._panel.pump()
+
+    @property
+    def last_fps(self) -> Optional[float]:
+        """Last reported main-loop FPS (None before the first one-second window)."""
+        return self._last_fps
+
+    @property
+    def panel_status(self) -> Optional[str]:
+        """Last panel-action message (e.g. 'Added window layer.' or an error)."""
+        return self._panel_status
+
+    def add_image_layer(self, image_path: str) -> None:
+        """Panel action: add an image layer from ``image_path``."""
+        self._panel_add_layer(lambda: _image_source_from_path(image_path), False, "image")
+
+    def add_window_layer(self, window_title: str) -> None:
+        """Panel action: add a live window layer from ``window_title``."""
+        self._panel_add_layer(lambda: _window_source_from_title(window_title), True, "window")
+
+    def add_screen_layer(self, monitor_index: int) -> None:
+        """Panel action: add a live monitor layer from ``monitor_index``."""
+        self._panel_add_layer(lambda: _monitor_source_from_index(monitor_index), True, "screen")
+
+    def _panel_add_layer(self, build_source: Callable[[], Source], live: bool, label: str) -> None:
+        """Add a layer for a panel action; surface the outcome to the status label.
+
+        Reuses ``_add_source_layer`` (no duplicated transition logic). A
+        ``SourceError`` is shown in the panel status AND printed to stderr, and
+        the scene is left unchanged -- never a crash or exit.
+        """
+        self.scene, self.interaction, self._fit_ids, error = _add_source_layer(
+            self.scene, self.interaction, self._fit_ids, build_source, live
+        )
+        if error is not None:
+            print(f"Error: {error}", file=sys.stderr)
+            self._panel_status = error
+        else:
+            self._panel_status = f"Added {label} layer."
+
+    def toggle_virtualcam(self) -> None:
+        """Panel action: flip the virtual-cam sink on/off (shares state with 'v')."""
+        self.virtualcam_active = not self.virtualcam_active
+
+    def reset_scene(self) -> None:
+        """Panel action: remove ALL layers (closing each source) and idle interaction.
+
+        Implemented as a runtime method (single writer of scene/interaction) so a
+        future hotkey could call it too. Reuses ``_close_layer_sources`` to stop
+        live capture threads. Interaction is reset only in image mode (it's None
+        in skeleton mode). Empties ``_fit_ids`` since every layer is gone.
+        """
+        _close_layer_sources(self.scene.layers)
+        self.scene = Scene()
+        if self.interaction is not None:
+            self.interaction = InteractionState.initial()
+        self._fit_ids = set()
+        self._panel_status = "Scene reset."
+
     @staticmethod
     def _primary_gesture(tracking: TrackingResult) -> Optional[GestureState]:
         """The primary hand's gesture state (slot 0), or None if none published."""
         return tracking.gesture_states[0] if tracking.gesture_states else None
+
+
+def _build_panel(runtime: "PipelineRuntime", prefill: Dict[str, Any]) -> Optional["ControlPanel"]:
+    """Create the Tk control panel bound to ``runtime``; None if Tk is unavailable.
+
+    Imported lazily so a headless/pure import of this module (and its unit tests)
+    never pulls in Tkinter. A ``PanelUnavailable`` (no display / Tk not built)
+    prints a notice and returns None so the app still runs with hotkeys only.
+    """
+    from src.panel import ControlPanel, PanelActions, PanelUnavailable
+
+    try:
+        return ControlPanel(PanelActions.from_runtime(runtime), prefill)
+    except PanelUnavailable as exc:
+        print(
+            f"Warning: control panel unavailable ({exc}); running with hotkeys only.",
+            file=sys.stderr,
+        )
+        return None
 
 
 def run(args: argparse.Namespace) -> None:
@@ -711,19 +930,35 @@ def run(args: argparse.Namespace) -> None:
     render (see ``PipelineRuntime`` / ``src.tracking.TrackingWorker`` /
     ``src.sources.threaded.ThreadedSource`` for the threading model). The webcam
     opens synchronously first (fail-fast on CameraError) before its thread starts.
+
+    Phase 10: unless ``--no-panel`` is set, a Tkinter control panel is created on
+    THIS (main) thread and pumped once per tick by the runtime; its buttons drive
+    the same runtime methods the hotkeys use. Last-used settings are loaded from
+    ``handy_config.json`` at start (CLI > config > defaults, see
+    ``resolve_panel_prefill``) and persisted back on exit.
     """
+    cfg = config.load_config(config.CONFIG_FILENAME)
+    prefill = resolve_panel_prefill(args, cfg)
+
     tracker, detectors, scene, interaction = _init_mode(args)
     preview = PreviewSink(WINDOW_NAME)
     virtualcam = VirtualCamSink()
     webcam = ThreadedSource(WebcamSource())
     worker: Optional[TrackingWorker] = None
     runtime: Optional[PipelineRuntime] = None
+    panel = None
 
     try:
         webcam.open()  # opens the camera (fail-fast) then starts the capture thread
         worker = TrackingWorker(tracker, detectors, webcam.latest_packet)
         worker.start()
-        runtime = PipelineRuntime(args, webcam, worker, scene, interaction, preview, virtualcam)
+        runtime = PipelineRuntime(
+            args, webcam, worker, scene, interaction, preview, virtualcam,
+            virtualcam_active=prefill["virtualcam"],
+        )
+        if not args.no_panel:
+            panel = _build_panel(runtime, prefill)
+            runtime.set_panel(panel)
         runtime.run()
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -746,6 +981,13 @@ def run(args: argparse.Namespace) -> None:
                 )
         preview.close()
         virtualcam.close()
+        # Persist last-used settings (source/path/title/monitor + vcam). Prefer
+        # the panel's live field values; fall back to the launch args when the
+        # panel was off (--no-panel) or never built. save_config never raises.
+        vcam_state = runtime.virtualcam_active if runtime is not None else args.virtualcam
+        config.save_config(config.CONFIG_FILENAME, _final_settings(panel, args, vcam_state))
+        if panel is not None:
+            panel.close()
         # Release any layer sources (stops live window/screen capture threads; a
         # no-op for image layers). Use the runtime's final scene so layers added
         # at runtime are also closed; fall back to the initial scene if the

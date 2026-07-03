@@ -18,7 +18,9 @@ Chunk 2 lifts most of the original exclusions: virtual camera output shipped in
 Phase 6 (`--virtualcam` / 'v' key via pyvirtualcam + OBS Virtual Camera); live
 window/screen capture shipped in Phase 7 (`--source window|screen` via
 windows-capture); multi-layer manipulation shipped in Phase 8 (add/remove/raise
-layers at runtime, pinch grabs the top-most layer under the pinch point).
+layers at runtime, pinch grabs the top-most layer under the pinch point); a
+Tkinter control panel + JSON settings persistence shipped in Phase 10
+(`src/panel.py`, `src/config.py`, `--no-panel` to opt out).
 Still out of scope:
 - iPhone/iPad mirroring
 - Any packaging/installer (Chunk 3)
@@ -60,6 +62,8 @@ shacam-win/
     ├── gestures.py         # pinch / grab detection from landmarks
     ├── hud.py              # heads-up display text + strip (incl. per-stage timing line)
     ├── fps.py              # frame-rate counter (main-loop rate)
+    ├── panel.py            # Tkinter control panel + PanelActions controller (Phase 10)
+    ├── config.py           # pure load/save/merge of the panel's last settings (handy_config.json)
     ├── sources/            # frame producers (Source contract) -> latest frame as numpy array
     │   ├── base.py         #   Source ABC + SourceError
     │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror (blocking read)
@@ -118,6 +122,23 @@ Press `q` to quit. Other runtime keys: `s` toggle skeleton, `r` reset transform,
 an image / window / screen layer (reusing the launch args), `x` remove the
 selected layer, `f` bring it to front. (A runtime key to toggle modes is a
 nice-to-have, not required.)
+
+### Control panel + config (Phase 10)
+By default a small Tkinter control panel opens next to the preview so the app is
+usable without memorizing hotkeys: choose a source (image via a file picker,
+window by title, monitor by index) and add it as a layer, toggle the virtual
+cam, reset the scene (removes all layers, closing each source), and read a live
+FPS value. The panel drives the same `PipelineRuntime` methods the hotkeys use
+(it is pumped once per main-loop tick on the main thread — Tkinter is not
+thread-safe — so button callbacks run inline between frames and the main loop
+stays the single writer of scene/interaction). Pass `--no-panel` to run
+hotkey-only (headless / keyboard-only). The last source choice, image path,
+window title, monitor index, and virtual-cam state persist to
+`handy_config.json` (repo root, git-ignored) on exit and pre-fill the panel on
+start. Startup precedence is **CLI flags > config > built-in defaults**; a
+missing or corrupt config falls back to defaults with a stderr notice, never a
+crash. See `src/config.py` (pure load/save/merge) and `src/panel.py`
+(controller + Tk view).
 
 ## Conventions
 - **Keep every increment runnable.** After each subplan the app must launch and show *something* on the webcam. No half-wired states.

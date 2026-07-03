@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import src.main
+from src import config
 from src.interaction import GrabState, InteractionState, ResizeState
 from src.main import (
     ADD_IMAGE_KEY,
@@ -30,6 +31,8 @@ from src.main import (
     TOGGLE_VIRTUALCAM_KEY,
     _apply_pending_fit,
     _build_layer_source,
+    _config_from_args,
+    _final_settings,
     _fit_layer_to_frame,
     _handle_image_key,
     _handle_layer_keys,
@@ -39,6 +42,7 @@ from src.main import (
     _toggle_skeleton,
     _toggle_virtualcam,
     parse_args,
+    resolve_panel_prefill,
 )
 from src.scene import Layer, Scene, Transform
 from src.sinks import SinkError
@@ -715,3 +719,243 @@ def test_next_frame_picks_up_new_sequence():
     assert runtime._next_frame().sum() == 0
     webcam.packet = (2, np.full((2, 2, 3), 7, dtype=np.uint8))
     assert int(runtime._next_frame().sum()) == 2 * 2 * 3 * 7
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10: --no-panel parsing
+# --------------------------------------------------------------------------- #
+
+def test_no_panel_defaults_false():
+    assert parse_args(["--mode", "skeleton"]).no_panel is False
+
+
+def test_no_panel_flag_enables():
+    assert parse_args(["--mode", "skeleton", "--no-panel"]).no_panel is True
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10: resolve_panel_prefill precedence (CLI > config > defaults)
+# --------------------------------------------------------------------------- #
+
+_FULL_CFG = {
+    "source": "screen",
+    "image_path": "cfg.png",
+    "window_title": "CfgTitle",
+    "monitor_index": 4,
+    "virtualcam": True,
+}
+
+
+def test_resolve_prefill_cli_nondefault_wins_over_config():
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "X"])
+    pf = resolve_panel_prefill(args, _FULL_CFG)
+    assert pf["source"] == "window"  # explicit CLI source beats config
+    assert pf["window_title"] == "X"  # explicit CLI title beats config
+    assert pf["virtualcam"] is True  # config True carries when CLI didn't force it
+
+
+def test_resolve_prefill_config_used_when_cli_at_default():
+    # source defaults to image, monitor to 1, image/title unset -> config fills in.
+    args = parse_args(["--mode", "image", "--image", "cli.png"])
+    pf = resolve_panel_prefill(args, _FULL_CFG)
+    assert pf["source"] == "screen"  # CLI at default -> remembered source
+    assert pf["monitor_index"] == 4  # CLI at default 1 -> remembered index
+    assert pf["window_title"] == "CfgTitle"  # CLI unset -> remembered title
+    assert pf["image_path"] == "cli.png"  # CLI image provided -> wins over config
+
+
+def test_resolve_prefill_cli_virtualcam_forces_on():
+    args = parse_args(["--mode", "skeleton", "--virtualcam"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["virtualcam"] is True
+
+
+def test_resolve_prefill_falls_back_to_defaults():
+    args = parse_args(["--mode", "image", "--image", "cli.png"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["source"] == "image"
+    assert pf["monitor_index"] == 1
+    assert pf["virtualcam"] is False
+    assert pf["window_title"] == ""
+
+
+def test_config_from_args_builds_dict():
+    args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "3"])
+    assert _config_from_args(args, True) == {
+        "source": "screen",
+        "image_path": "",
+        "window_title": "",
+        "monitor_index": 3,
+        "virtualcam": True,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10: PipelineRuntime panel-drive methods (add / reset / toggle / pump)
+# --------------------------------------------------------------------------- #
+
+def _image_runtime(scene=None, interaction=None, virtualcam_active=None) -> PipelineRuntime:
+    # Sinks/worker are None: the panel-drive methods only touch scene /
+    # interaction / fit_ids / virtualcam_active / panel_status.
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    return PipelineRuntime(
+        args,
+        _FakePacketWebcam(),
+        None,
+        scene if scene is not None else Scene(),
+        interaction if interaction is not None else InteractionState.initial(),
+        None,
+        None,
+        virtualcam_active=virtualcam_active,
+    )
+
+
+def test_runtime_virtualcam_active_initialized_from_param():
+    assert _image_runtime(virtualcam_active=True).virtualcam_active is True
+    assert _image_runtime().virtualcam_active is False  # defaults to args.virtualcam
+
+
+def test_runtime_toggle_virtualcam_flips():
+    rt = _image_runtime()
+    rt.toggle_virtualcam()
+    assert rt.virtualcam_active is True
+    rt.toggle_virtualcam()
+    assert rt.virtualcam_active is False
+
+
+def test_runtime_add_image_layer_success_sets_status():
+    rt = _image_runtime(scene=_scene())
+    rt.add_image_layer("assets/test.png")
+    assert len(rt.scene.layers) == 2
+    assert isinstance(rt.scene.selected_layer.source, ImageSource)
+    assert "image" in rt.panel_status.lower()
+
+
+def test_runtime_add_image_layer_bad_path_surfaces_status_not_crash(capsys):
+    rt = _image_runtime(scene=_scene())
+    before = rt.scene
+    rt.add_image_layer("")  # empty path -> SourceError
+    assert rt.scene is before  # unchanged, no exit
+    assert "image" in rt.panel_status.lower()  # shown in the panel
+    assert "image" in capsys.readouterr().err.lower()  # and on stderr
+
+
+def test_runtime_add_window_layer_success_marks_fit(monkeypatch):
+    monkeypatch.setattr(src.main, "WindowSource", _FakeLiveSource)
+    rt = _image_runtime(scene=_scene())
+    rt.add_window_layer("Pad")
+    added = rt.scene.selected_layer
+    assert isinstance(added.source, _FakeLiveSource)
+    assert added.source.args == ("Pad",)  # built from the panel-supplied title
+    assert added.layer_id in rt._fit_ids  # live source -> pending fit
+    assert "window" in rt.panel_status.lower()
+
+
+def test_runtime_add_window_layer_source_error_surfaces_status(monkeypatch, capsys):
+    class _FailingWindowSource:
+        def __init__(self, title):
+            pass
+
+        def open(self):
+            raise SourceError("Could not capture a window matching title 'X'.")
+
+    monkeypatch.setattr(src.main, "WindowSource", _FailingWindowSource)
+    rt = _image_runtime(scene=_scene())
+    before = rt.scene
+    rt.add_window_layer("X")
+    assert rt.scene is before  # add failed -> scene untouched
+    assert "window" in rt.panel_status.lower()
+    assert capsys.readouterr().err  # also printed to stderr
+
+
+def test_runtime_add_screen_layer_uses_index(monkeypatch):
+    monkeypatch.setattr(src.main, "MonitorSource", _FakeLiveSource)
+    rt = _image_runtime(scene=_scene())
+    rt.add_screen_layer(2)
+    added = rt.scene.selected_layer
+    assert isinstance(added.source, _FakeLiveSource)
+    assert added.source.args == (2,)  # built from the panel-supplied index
+
+
+def test_runtime_reset_scene_closes_all_sources_and_idles():
+    src0, src1 = _ClosableSource(), _ClosableSource()
+    scene = Scene().add_layer(_layer_with(src0)).add_layer(_layer_with(src1))
+    grabbed = InteractionState(
+        grab=GrabState(is_grabbed=True, offset=(0.1, 0.1), was_pinching=True)
+    )
+    rt = _image_runtime(scene=scene, interaction=grabbed)
+    rt._fit_ids = {1}
+    rt.reset_scene()
+    assert src0.closed is True and src1.closed is True  # every source released
+    assert rt.scene.layers == ()  # scene emptied
+    assert rt.interaction.grab.is_grabbed is False  # interaction idled
+    assert rt._fit_ids == set()
+    assert rt.panel_status == "Scene reset."
+
+
+class _FakePanel:
+    """Records pump() calls (stand-in for the Tk ControlPanel)."""
+
+    def __init__(self):
+        self.pumped = 0
+
+    def pump(self):
+        self.pumped += 1
+
+
+def test_runtime_pump_panel_calls_through():
+    rt = _image_runtime()
+    panel = _FakePanel()
+    rt.set_panel(panel)
+    rt._pump_panel()
+    rt._pump_panel()
+    assert panel.pumped == 2
+
+
+def test_runtime_pump_panel_noop_without_panel():
+    _image_runtime()._pump_panel()  # no panel attached -> must not raise
+
+
+def test_runtime_reset_scene_in_skeleton_mode_tolerates_none_interaction():
+    # Skeleton mode has interaction=None; reset must still close sources and
+    # empty the scene without touching (or inventing) interaction state.
+    args = parse_args(["--mode", "skeleton"])
+    source = _ClosableSource()
+    scene = Scene().add_layer(_layer_with(source))
+    rt = PipelineRuntime(args, _FakePacketWebcam(), None, scene, None, None, None)
+    rt.reset_scene()
+    assert source.closed is True
+    assert rt.scene.layers == ()
+    assert rt.interaction is None
+
+
+# --------------------------------------------------------------------------- #
+# _final_settings: what gets persisted on exit
+# --------------------------------------------------------------------------- #
+
+class _SettingsPanel:
+    """Panel stand-in whose checkbox froze at virtualcam=False."""
+
+    @staticmethod
+    def current_settings():
+        return {
+            "source": "window",
+            "image_path": "",
+            "window_title": "Pad",
+            "monitor_index": 2,
+            "virtualcam": False,  # frozen: panel window was closed before quit
+        }
+
+
+def test_final_settings_runtime_vcam_overrides_frozen_panel_checkbox():
+    args = parse_args(["--mode", "skeleton"])
+    out = _final_settings(_SettingsPanel(), args, True)
+    assert out["virtualcam"] is True  # runtime toggle is authoritative
+    assert out["window_title"] == "Pad"  # other fields still from the panel
+
+
+def test_final_settings_without_panel_uses_args():
+    args = parse_args(["--mode", "image", "--image", "a.png"])
+    out = _final_settings(None, args, False)
+    assert out["image_path"] == "a.png"
+    assert out["virtualcam"] is False

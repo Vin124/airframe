@@ -12,7 +12,16 @@ python -m src.main --mode image --image assets/test.png   # + pinch-to-grab imag
 python -m src.main --mode image --source window --window-title "Notepad"  # grab a live window
 python -m src.main --mode image --source screen --monitor-index 1         # grab a monitor (1-based)
 python -m src.main --mode skeleton --gpu      # request GPU delegate (falls back to CPU on Windows)
+python -m src.main --mode image --image assets/test.png --no-panel  # hotkeys only, no control panel
 ```
+A small **Tkinter control panel** opens alongside the preview by default (Phase
+10): pick a source (image file picker / window title / monitor index) and add it
+as a layer, toggle the virtual cam, reset the scene, watch a live FPS readout.
+Its buttons drive the same runtime the hotkeys use. Pass `--no-panel` to run
+hotkey-only. Last-used panel settings persist to `handy_config.json` (repo root,
+git-ignored) on exit and pre-fill on start; precedence is **CLI > config >
+defaults**.
+
 Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
 `v` toggle virtual cam. Image-mode multi-layer: `a`/`w`/`m` add an image / window
 / screen layer (reusing the launch args), `x` remove the selected layer, `f`
@@ -34,6 +43,8 @@ src/skeleton.py       # draw landmarks + connections (debug overlay)
 src/gestures.py       # pinch/grab detection from landmarks
 src/hud.py            # heads-up display text + strip (incl. per-stage timing line)
 src/fps.py            # frame-rate counter (loop rate)
+src/panel.py          # Tkinter control panel + PanelActions controller (Phase 10); pumped by PipelineRuntime
+src/config.py         # pure load/save/merge of the panel's last settings (handy_config.json)
 src/sources/          # frame producers (Source contract) -> latest frame as numpy array
     base.py           #   Source ABC + SourceError
     webcam.py         #   WebcamSource: live feed, applies the selfie mirror (blocking read)
@@ -86,3 +97,13 @@ publish per hand-off, GIL-safe, latest-frame-wins):
   pinch to grab whichever is under the pinch point, bring-to-front, all live.
   Selection is single (exactly one active layer); layers carry a stable
   `layer_id` so remove/raise/fit target a layer across move/resize copies.
+- The control panel (Phase 10) is Tkinter, which is NOT thread-safe: it runs on
+  the MAIN thread, created after the camera opens and pumped once per tick by
+  `PipelineRuntime._pump_panel` (a non-blocking `root.update()`). Button
+  callbacks therefore fire inline on the main thread between frames and call the
+  same `PipelineRuntime` add/reset/toggle methods the hotkeys use, so the main
+  loop stays the single writer of scene/interaction (no queues, no duplicated
+  logic). Closing the panel window keeps the app running (hotkeys still work);
+  the pump becomes a no-op. If Tk can't init (no display), the app prints a
+  notice and runs hotkey-only. A `SourceError` from a panel add-layer shows in
+  the panel's status label + stderr and never crashes/exits.
