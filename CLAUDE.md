@@ -44,7 +44,12 @@ the selected layer is outlined. Image-mode air-drawing (Phase 11): hold the draw
 pose (index extended, other fingers curled) and move your fingertip to draw a
 smoothed stroke; release the pose to freeze it into a grabbable/movable layer.
 `c` clears the in-progress stroke, `k` cycles stroke color, `[` / `]` step the
-stroke width down / up.
+stroke width down / up. Spawn gesture (Phase 15, needs `--speech --parse`): when
+speech->parser->retriever fetches an image it docks as a PREVIEW at the top edge
+of the frame; a pinch that STARTS over the dock and pulls DOWN past a threshold
+instantiates it as a new layer at the pinch point (the existing move/resize then
+takes over), and an ignored preview auto-dismisses after a few seconds. The
+docked preview composites through to the virtual cam.
 
 ## Structure
 Pipeline: webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**.
@@ -60,7 +65,8 @@ src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; -
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
 src/speech.py         # SpeechWorker: mic capture + energy-VAD phrase segmentation + ASR (Moonshine -> faster-whisper fallback) on its own thread (Phase 12); pure VAD + rolling-transcript helpers; deferred deps; speech_session() launch glue
 src/parser.py          # RequestParser: one finalized phrase -> a strict-JSON structured ParsedRequest via a local Ollama model (Phase 13); pure prompt-build + JSON-extract + enum-normalize helpers are the security boundary; OllamaClient speaks Ollama's HTTP API over stdlib urllib (no new dep); wired as (part of) the speech thread's on_phrase callback, see src/launch.py's build_speech_on_phrase
-src/retriever.py       # Retriever: a parsed retrieve request -> a downloaded, decoded BGRA RetrievedAsset (Phase 14). Swappable RetrievalSource backends: WikimediaSource (default, MediaWiki Commons API, stdlib urllib, no dep) -> WebSearchSource (fallback, DuckDuckGo via lazily-imported ddgs) with an optional LocalLibrarySource (filename-substring, CLIP deferred) tried first. select_best_image + decode_to_bgra + is_allowed_url are pure/unit-tested; remote URLs come from search + are only lightly validated (scheme/size/timeout/dim caps). Runs on the SPEECH thread via build_speech_on_phrase; never touches the scene (that's Phase 15)
+src/retriever.py       # Retriever: a parsed retrieve request -> a downloaded, decoded BGRA RetrievedAsset (Phase 14). Swappable RetrievalSource backends: WikimediaSource (default, MediaWiki Commons API, stdlib urllib, no dep) -> WebSearchSource (fallback, DuckDuckGo via lazily-imported ddgs) with an optional LocalLibrarySource (filename-substring, CLIP deferred) tried first. select_best_image + decode_to_bgra + is_allowed_url are pure/unit-tested; remote URLs come from search + are only lightly validated (scheme/size/timeout/dim caps). Runs on the SPEECH thread via build_speech_on_phrase; publishes its asset to the Phase 15 PreviewInbox
+src/spawn.py           # Spawn gesture (Phase 15): PreviewInbox (the ONE speech->main atomic hand-off slot) + pure dock geometry (dock_rect/pinch_over_dock/pull_down_distance/spawn_transform) + the advance_spawn state machine (frozen PreviewState: IDLE docked -> GRABBED -> spawn/dismiss) + suppress_spawn_pinch precedence + render_dock (draws the docked preview onto the composited frame). Pure numpy/cv2 except PreviewInbox; no camera/mediapipe/threads. The main loop is the sole scene writer
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
 src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
@@ -187,8 +193,27 @@ hand-off, GIL-safe, latest-frame-wins):
   land in `<tempdir>/shacam_cache`; the decoded BGRA is the in-hand asset.
   `Retriever.retrieve` NEVER raises (degrade-never-die): a no-result/network
   error returns `None` + a notice. It runs ON THE SPEECH thread (blocking network
-  is fine there, NEVER on the render loop) and does NOT spawn into the scene yet
-  (that's Phase 15).
+  is fine there, NEVER on the render loop) and hands its asset to Phase 15 via the
+  `PreviewInbox` (see below).
+- Spawn gesture (Phase 15, `src/spawn.py`, reached via `--speech --parse`): the
+  `PreviewInbox` is the ONE speech->main hand-off — `publish(asset)` runs on the
+  SPEECH thread (in `build_speech_on_phrase`, in ADDITION to the `[retriever]`
+  log), `take()` runs on the MAIN loop each tick; it's a single atomic reference
+  slot (GIL-safe, no lock, latest-wins), so the speech thread NEVER touches
+  scene/interaction/preview state and the MAIN LOOP STAYS THE SOLE SCENE WRITER
+  (same discipline as `ThreadedSource`/`TrackingWorker`). The main loop drains it,
+  docks the asset as a preview (`PreviewState`, frozen; phases IDLE docked ->
+  GRABBED -> spawn/dismiss), and runs the pure `advance_spawn` off the PRIMARY
+  hand: a pinch RISING EDGE over the dock grabs it, pulling DOWN past
+  `PULL_DOWN_DISTANCE` adds an `ArraySource` layer at the pinch (via the same
+  `Scene.add_layer` air-drawing uses) and resets interaction so the held pinch
+  cleanly grabs the new layer; an ignored preview dismisses after
+  `DISMISS_SECONDS`. Precedence: while GRABBED, `suppress_spawn_pinch` masks the
+  spawning hand's pinch from `interaction.step` (like `suppress_draw_pinch`) so
+  dragging the preview can't also grab a scene layer; once spawned, suppression
+  stops. `render_dock` draws the docked preview onto the composited copy AFTER the
+  compositor + active stroke, BEFORE the HUD, so it shows in BOTH the preview and
+  the virtual cam. All thresholds are module constants in `src/spawn.py`.
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
   confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it

@@ -1,25 +1,14 @@
 """Entry point: argument parsing, mode dispatch, and the main pipeline loop.
 
-The app is a small pipeline: a webcam ``Source`` produces the background frame,
-a ``Scene`` of ``Layer`` objects is composited over it, and the result goes to a
+The app is a small pipeline: a webcam ``Source`` produces the background frame, a
+``Scene`` of ``Layer`` objects is composited over it, and the result goes to a
 preview ``Sink``. Hand tracking + gesture detection drive interaction on the
-selected layer.
-
-Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
-21-point skeleton and a pinch/grab gesture debug label on the mirrored feed.
-Image mode starts with one overlay ``Layer`` you can pinch-grab/move, scale with
-+/- keys, and two-hand-pinch to resize (see ``src.interaction``). Its source is
-chosen by ``--source``: a static image (default), a live app ``window`` by title,
-or a monitor ``screen`` (Windows Graphics Capture). At runtime you can add more
-layers ('a'/'w'/'m'), remove the selected one ('x'), and bring it to front ('f');
-a pinch grabs the top-most layer under the pinch point, which is outlined. Both
-modes mirror the feed, show it via ``PreviewSink``, print FPS, draw a small HUD,
-and quit on 'q'. Optionally (``--virtualcam`` / 'v' key) the composited+HUD frame
-is also broadcast to a virtual webcam so it can be picked in Zoom/Teams/Meet.
-
-The scene/source-layer transitions live in ``src.layers`` and the launch-time
-settings glue (panel prefill, config <-> args, panel build) in ``src.launch``;
-both are re-exported below so the test import surface stays on ``src.main``.
+selected layer. Skeleton mode draws a 21-point skeleton over an empty scene;
+image mode starts with one overlay layer you pinch-grab/move/resize, add to
+('a'/'w'/'m'), remove ('x'), or raise ('f'). Both mirror the feed, draw a HUD,
+print FPS, quit on 'q', and can broadcast to a virtual cam (``--virtualcam`` /
+'v'). The scene/source-layer transitions live in ``src.layers`` and the launch
+glue in ``src.launch``; both are re-exported below for the test import surface.
 """
 
 import argparse
@@ -70,13 +59,10 @@ from src.tuning import (
     clamp_tuning,
 )
 
-# Re-exported for the test import surface: tests/test_main.py imports these
-# names from src.main. Their implementations (and the mode/source/layer-key
-# vocabulary) moved to src.layers / src.launch during the Phase 5-10 extraction;
-# importing them here keeps ``from src.main import _build_layer_source`` (etc.)
-# working, and most are also used directly by the code below. Tests that
-# monkeypatch the capture classes now patch src.layers.WindowSource /
-# src.layers.MonitorSource (the moved builders resolve them there).
+# Re-exported for the test import surface (tests import these from src.main); the
+# implementations + the mode/source/layer-key vocabulary moved to src.layers /
+# src.launch in the Phase 5-10 extraction, and most are also used below. Tests
+# monkeypatch the capture classes at src.layers.WindowSource / MonitorSource.
 from src.layers import (  # noqa: F401  (re-exported for tests / used below)
     ADD_IMAGE_KEY,
     ADD_SCREEN_KEY,
@@ -116,6 +102,10 @@ from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     parse_args,
     resolve_panel_prefill,
     tuning_from_prefill,
+)
+from src.spawn import (  # noqa: F401  (Phase 15 spawn gesture; re-exported for tests)
+    PreviewInbox, PreviewState, advance_spawn, dock_preview, render_dock,
+    suppress_spawn_pinch,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
@@ -275,25 +265,15 @@ def _init_mode(
 class PipelineRuntime:
     """Owns the per-frame main-loop state and drives one composite/display tick.
 
-    Phase 9 decouples the pipeline into three threads:
-      - a CAPTURE thread (``ThreadedSource`` around the webcam) publishing frames
-        latest-frame-wins,
-      - a TRACKING thread (``TrackingWorker``) detecting hands + advancing gesture
-        hysteresis at its own cadence and publishing results latest-wins,
-      - this MAIN loop, which is the SINGLE WRITER of the scene/interaction and
-        composites + displays paced to ``TARGET_FPS``.
-
-    This object lives on the main thread only. It reads the two threads' latest
-    published values (never mutating their state) and threads the immutable
-    scene/interaction forward each frame. It's split out of ``run`` so the loop
-    body is a handful of small named stages and ``run`` stays a thin
-    setup/teardown shell; the stages are unit-testable with fakes.
-
-    ``show_skeleton`` starts True in skeleton mode and from --debug-skeleton in
-    image mode; 's' flips it live. ``virtualcam_ever_sent`` distinguishes a fatal
-    first-attempt virtual-cam failure from a graceful later one (see
-    ``_pump_virtualcam``). Stage timings are EMA-smoothed and shown one frame late
-    (the snapshot updates after the HUD is drawn).
+    Phase 9 decouples the pipeline into three threads: a CAPTURE thread
+    (``ThreadedSource``) publishing frames latest-wins, a TRACKING thread
+    (``TrackingWorker``) publishing hand + gesture results latest-wins, and this
+    MAIN loop -- the SINGLE WRITER of scene/interaction -- which composites +
+    displays paced to ``TARGET_FPS``. It lives on the main thread only, reading the
+    two threads' latest published values (never mutating them). Split out of
+    ``run`` so the loop body is small named stages, unit-testable with fakes.
+    ``show_skeleton`` starts from mode/--debug-skeleton ('s' flips it);
+    ``virtualcam_ever_sent`` gates the fatal-first vs graceful-later cam failure.
     """
 
     def __init__(
@@ -307,26 +287,28 @@ class PipelineRuntime:
         virtualcam: VirtualCamSink,
         virtualcam_active: Optional[bool] = None,
         tuning: Optional[GestureTuning] = None,
+        inbox: Optional[PreviewInbox] = None,
     ) -> None:
         self._args = args
         self._webcam = webcam
         self._worker = worker
         self._preview = preview
         self._virtualcam = virtualcam
+        # Phase 15: speech->main hand-off slot (None = no spawn path) + the docked
+        # preview/spawn state, owned solely by this main loop.
+        self._inbox = inbox
+        self._preview_state = PreviewState()
         self.scene = scene
         self.interaction = interaction
-        # Last-applied pinch tuning (runtime-authoritative, driven by the panel
-        # sliders via set_tuning). Defaults to the built-ins; run() passes the
-        # resolved startup value so it matches the detectors' initial thresholds.
+        # Last-applied pinch tuning (runtime-authoritative, driven by the sliders);
+        # run() passes the resolved startup value matching the detectors.
         self.tuning = tuning if tuning is not None else GestureTuning(
             PINCH_ENTER_THRESHOLD, PINCH_EXIT_THRESHOLD
         )
         self.show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
-        # Initial virtual-cam state: the resolved CLI-or-config value (see
-        # resolve_panel_prefill). Defaults to the --virtualcam flag when unset so
-        # existing callers/tests keep the old behavior. Note the fatal-on-first-
-        # failure check in _pump_virtualcam still keys off args.virtualcam, so a
-        # config-driven ON is treated like a runtime 'v' toggle (graceful).
+        # Initial virtual-cam state: resolved CLI-or-config value. The fatal-on-
+        # first-failure check in _pump_virtualcam still keys off args.virtualcam, so
+        # a config-driven ON degrades gracefully like a runtime 'v' toggle.
         self.virtualcam_active = args.virtualcam if virtualcam_active is None else virtualcam_active
         self._virtualcam_ever_sent = False
         self._fit_ids = _initial_fit_ids(args, scene)
@@ -338,10 +320,9 @@ class PipelineRuntime:
         self._panel_status: Optional[str] = None  # last panel-action message
         self._panel = None  # optional Tk ControlPanel, pumped once per tick
         self._timings = StageTimings()
-        # Air-drawing state (Phase 11), owned solely by this main loop (the
-        # single writer of scene/interaction). ``_stroke`` is the in-progress
-        # path (None between strokes); color/width are the current pen settings
-        # driven by the c/k/[/] keys and baked in when a stroke freezes.
+        # Air-drawing state (Phase 11), owned solely by this main loop. ``_stroke``
+        # is the in-progress path (None between strokes); color/width are the pen
+        # settings driven by the c/k/[/] keys and baked in when a stroke freezes.
         self._stroke: Optional[drawing.Stroke] = None
         self._stroke_color_index = 0
         self._stroke_width = drawing.DEFAULT_STROKE_WIDTH
@@ -354,11 +335,9 @@ class PipelineRuntime:
     def _run_frame(self) -> bool:
         """One main-loop iteration. Returns False to quit.
 
-        Does the frame's work, pumps the window + reads a key with a single
-        ``cv2.waitKey(1)``, then paces to ``TARGET_FPS`` by sleeping the remainder
-        of the budget (a precise ``time.sleep`` -- cv2.waitKey's Windows timer is
-        too coarse to pace accurately). ``loop_ms`` is the work + key-pump time
-        (excludes the pacing sleep); timings are recorded for the NEXT frame's HUD.
+        Does the frame's work, pumps the window + reads a key with one
+        ``cv2.waitKey(1)``, then paces to ``TARGET_FPS`` with a precise
+        ``time.sleep`` of the remaining budget. Timings feed the NEXT frame's HUD.
         """
         frame_start = time.perf_counter()
         frame = self._next_frame()
@@ -391,13 +370,9 @@ class PipelineRuntime:
         """Return a fresh, mutable compositing copy of the current webcam frame.
 
         The capture thread publishes each frame as a shared, READ-ONLY array; the
-        compositor draws in place, so we hand back a private per-frame COPY (never
-        mutating the shared frame the tracking thread also reads). A new copy is
-        taken only when the camera has published a new sequence, but a fresh copy
-        of the clean frame is returned every tick so drawings never accumulate.
-        Reuses the last clean frame when no newer one exists (render can repeat a
-        frame so interaction/HUD stay live); returns ``None`` only before the very
-        first frame arrives.
+        compositor draws in place, so we hand back a private per-frame COPY every
+        tick (adopting a new clean frame only on a new sequence, reusing the last
+        one otherwise). ``None`` only before the very first frame arrives.
         """
         packet = self._webcam.latest_packet()
         if packet is not None and packet[0] != self._clean_seq:
@@ -411,22 +386,24 @@ class PipelineRuntime:
         """Apply the one-time live-layer fit + advance interaction (image mode only).
 
         Single writer of scene/interaction (main thread). Runs the initial fit
-        BEFORE ``step`` so grab/move/resize act on the fitted layer from the
-        start; ``step`` resolves selection + advances the active layer and
-        tolerates an empty scene. Skeleton mode has no layers, so this only clears
-        the status.
+        BEFORE ``step``; drawing + spawn also run before it (each may add a layer
+        and mask a hand's pinch from ``step``). Skeleton mode just clears status.
         """
         if self._args.mode != MODE_IMAGE:
             self._status = None
             return
         self.scene, self._fit_ids = _apply_pending_fit(self.scene, self._fit_ids, frame_size)
         gesture_states = list(tracking.gesture_states)
-        # Air-drawing runs BEFORE interaction: it may freeze a released stroke
-        # into a new (selected) layer, and suppressing pinch on any drawing hand
-        # keeps that hand's curled pose from also starting a grab/resize.
+        # Air-drawing (reads is_draw off the raw states) may freeze a stroke layer.
         self._advance_drawing(gesture_states, frame_size)
+        # Suppress a drawing hand's pinch ONCE, feed it to BOTH spawn and step, so a
+        # draw pose grabs neither the docked preview nor a scene layer. Spawn runs
+        # before interaction; a pinch dragging the preview is masked from step too.
+        undrawn = suppress_draw_pinch(gesture_states)
+        grabbing = self._advance_spawn(undrawn, frame_size)
+        gestures = suppress_spawn_pinch(undrawn, grabbing)
         self.interaction, self.scene = step(
-            self.interaction, self.scene, suppress_draw_pinch(gesture_states), frame_size
+            self.interaction, self.scene, gestures, frame_size
         )
         self._status = hud.resize_or_grab_status(
             self.interaction.grab.is_grabbed, self.interaction.resize.is_resizing
@@ -453,10 +430,9 @@ class PipelineRuntime:
         """Rasterize the released stroke into a new, grabbable scene layer.
 
         ``drawing.freeze_stroke`` does the pure smooth -> rasterize -> place math
-        (``None`` for a too-short stroke: a tap isn't a drawing); the result is
-        added through the normal ``Scene.add_layer`` machinery so it lands on
-        top, selected, with a stable id. Interaction is reset to idle so no
-        stale pinch edge grabs the new layer.
+        (``None`` for a too-short tap); the result is added via ``Scene.add_layer``
+        (top, selected, stable id) and interaction is reset so no stale pinch edge
+        grabs the new layer.
         """
         stroke = self._stroke
         self._stroke = None
@@ -471,6 +447,34 @@ class PipelineRuntime:
         self.scene = self.scene.add_layer(Layer(source=ArraySource(bgra), transform=transform))
         if self.interaction is not None:
             self.interaction = InteractionState.initial()
+
+    def _advance_spawn(self, gesture_states: list, frame_size: Tuple[int, int]) -> bool:
+        """Drain the preview inbox, advance the spawn machine, apply any spawn.
+
+        Single writer of scene/interaction (main thread): docks any asset the
+        SPEECH thread published, advances the pure ``advance_spawn`` off the PRIMARY
+        hand, and on a spawn action adds an ``ArraySource`` layer at the pull-to
+        point via the same ``add_layer`` machinery air-drawing uses (selected, on
+        top), resetting interaction so the still-held pinch grabs the new layer.
+        Returns whether a preview is being dragged (for the pinch suppression).
+        """
+        now = time.perf_counter()
+        primary = gesture_states[0] if gesture_states else None
+        if self._inbox is not None:
+            asset = self._inbox.take()
+            if asset is not None:
+                pinching = bool(primary is not None and primary.is_pinching)
+                self._preview_state = dock_preview(asset, now, pinching)
+        self._preview_state, action = advance_spawn(
+            self._preview_state, primary, now, frame_size
+        )
+        if action is not None:
+            self.scene = self.scene.add_layer(
+                Layer(ArraySource(action.asset.bgra), action.transform)
+            )
+            if self.interaction is not None:
+                self.interaction = InteractionState.initial()
+        return self._preview_state.is_grabbing
 
     def clear_stroke(self) -> None:
         """Discard the in-progress stroke without freezing it (the 'c' key)."""
@@ -499,8 +503,8 @@ class PipelineRuntime:
         """Composite the scene + selection highlight (+ optional skeleton); return ms.
 
         Empty scene in skeleton mode = a no-op composite; the skeleton + gesture
-        debug label is drawn on top when enabled, using the tracking thread's
-        latest hands/gesture (possibly frozen if tracking crashed).
+        label draws on top when enabled. The docked preview (Phase 15) draws last,
+        after the active stroke and before the HUD, so it shows in the vcam too.
         """
         with StageTimer() as timer:
             compositor.render(frame, self.scene)
@@ -508,14 +512,13 @@ class PipelineRuntime:
             if self.show_skeleton:
                 _draw_debug(frame, list(tracking.hands), self._primary_gesture(tracking))
             self._draw_active_stroke(frame)
+            render_dock(frame, self._preview_state)  # docked preview -> preview + vcam
         return timer.ms
 
     def _draw_active_stroke(self, frame: np.ndarray) -> None:
         """Overlay the in-progress stroke + fingertip cursor (after compositing).
 
-        Main-thread drawing on the private composited copy (allowed), so drawing
-        feels responsive before the stroke is frozen. A no-op when no stroke is
-        active.
+        Main-thread drawing on the private composited copy; no-op when no stroke.
         """
         if self._stroke is None or self._stroke.is_empty:
             return
@@ -704,16 +707,11 @@ def run(args: argparse.Namespace) -> None:
 
     Capture (webcam) and hand tracking each run on their OWN thread publishing
     latest-frame-wins; this main thread only composites + displays + handles keys,
-    paced to ``TARGET_FPS`` -- so a slow camera or a ~40ms detect no longer stalls
-    render (see ``PipelineRuntime`` / ``src.tracking.TrackingWorker`` /
-    ``src.sources.threaded.ThreadedSource`` for the threading model). The webcam
-    opens synchronously first (fail-fast on CameraError) before its thread starts.
-
-    Phase 10: unless ``--no-panel`` is set, a Tkinter control panel is created on
-    THIS (main) thread and pumped once per tick by the runtime; its buttons drive
-    the same runtime methods the hotkeys use. Last-used settings are loaded from
-    ``handy_config.json`` at start (CLI > config > defaults, see
-    ``resolve_panel_prefill``) and persisted back on exit.
+    paced to ``TARGET_FPS`` (see ``PipelineRuntime`` / ``TrackingWorker`` /
+    ``ThreadedSource``). The webcam opens synchronously first (fail-fast) before
+    its thread starts. Unless ``--no-panel``, a Tk panel is created on this thread
+    and pumped per tick. Settings load from ``handy_config.json`` (CLI > config >
+    defaults) and persist back on exit.
     """
     cfg = config.load_config(config.CONFIG_FILENAME)
     prefill = resolve_panel_prefill(args, cfg)
@@ -728,6 +726,7 @@ def run(args: argparse.Namespace) -> None:
     preview = PreviewSink(WINDOW_NAME)
     virtualcam = VirtualCamSink()
     webcam = ThreadedSource(WebcamSource())
+    inbox = PreviewInbox()  # Phase 15: the speech->main asset hand-off slot
     worker: Optional[TrackingWorker] = None
     runtime: Optional[PipelineRuntime] = None
     panel = None
@@ -740,14 +739,16 @@ def run(args: argparse.Namespace) -> None:
             args, webcam, worker, scene, interaction, preview, virtualcam,
             virtualcam_active=prefill["virtualcam"],
             tuning=tuning,
+            inbox=inbox,
         )
         if not args.no_panel:
             panel = _build_panel(runtime, prefill)
             runtime.set_panel(panel)
-        # Speech (Phase 12) runs on its OWN thread. Phase 13: when --parse is on,
-        # its finalized-phrase callback runs the LLM parser ON THE SPEECH THREAD
-        # (never the render loop); None = default [speech]-only transcript.
-        with speech_session(prefill["speech"], on_phrase=build_speech_on_phrase(prefill["parse"])):
+        # Speech (Phase 12) runs on its OWN thread. Phase 13/14: when --parse is
+        # on, its finalized-phrase callback parses + retrieves ON THE SPEECH
+        # THREAD and publishes any asset to the inbox (Phase 15). None = default.
+        on_phrase = build_speech_on_phrase(prefill["parse"], inbox)
+        with speech_session(prefill["speech"], on_phrase=on_phrase):
             runtime.run()
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)

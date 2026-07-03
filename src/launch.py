@@ -33,6 +33,7 @@ from src.tuning import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
     from src.main import PipelineRuntime
     from src.panel import ControlPanel
+    from src.spawn import PreviewInbox
     from src.speech import PhraseCallback
 
 
@@ -157,8 +158,10 @@ def _final_settings(
     return settings
 
 
-def build_speech_on_phrase(parse_enabled: bool) -> Optional["PhraseCallback"]:
-    """Compose the speech ``on_phrase`` callback (the Phase 13/14 wiring seam).
+def build_speech_on_phrase(
+    parse_enabled: bool, inbox: Optional["PreviewInbox"] = None
+) -> Optional["PhraseCallback"]:
+    """Compose the speech ``on_phrase`` callback (the Phase 13/14/15 wiring seam).
 
     Returns ``None`` when parsing is off, so ``speech_session`` keeps its default
     callback (which prints the live ``[speech]`` transcript). When on, returns a
@@ -169,15 +172,20 @@ def build_speech_on_phrase(parse_enabled: bool) -> Optional["PhraseCallback"]:
     '<query>'``). Non-actionable / failed parses return ``None`` and are ignored;
     ``generate``-routed requests are left for Phase 16.
 
+    Phase 15: when an ``inbox`` (``PreviewInbox``) is supplied, a fetched asset is
+    ALSO published to it (in addition to the log line) so the main loop can dock it
+    as a spawnable preview. With ``inbox=None`` this behaves exactly as before
+    (log-only), so the Phase 13/14 unit tests are unaffected.
+
     THREADING: this callback runs on the SPEECH thread (``SpeechWorker`` invokes
     ``on_phrase`` there, never the render loop). Both ``RequestParser.parse`` and
     ``Retriever.retrieve`` BLOCK on the network for up to their bounded timeouts,
     which is fine off the render thread and can't stall render/tracking FPS; the
-    worker's bounded ``stop()`` join keeps a slow call from wedging shutdown. Kept
-    in the launch layer so the parser + retriever are composed once here rather
-    than threaded through many layers. The parser/retriever/speech imports are
-    deferred so a headless import of this module (and its unit tests) doesn't pull
-    them in.
+    worker's bounded ``stop()`` join keeps a slow call from wedging shutdown. The
+    ``inbox.publish`` is a single atomic reference store (no lock) -- the speech
+    thread never touches scene/interaction, only drops the asset in the slot. The
+    parser/retriever/speech imports are deferred so a headless import of this
+    module (and its unit tests) doesn't pull them in.
     """
     if not parse_enabled:
         return None
@@ -205,6 +213,8 @@ def build_speech_on_phrase(parse_enabled: bool) -> Optional["PhraseCallback"]:
             f"[retriever] got {width}x{height} image for "
             f"'{request.query}' from {asset.source_name}"
         )
+        if inbox is not None:
+            inbox.publish(asset)  # Phase 15: hand it to the main loop to dock
 
     return on_phrase
 
