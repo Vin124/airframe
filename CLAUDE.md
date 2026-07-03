@@ -9,6 +9,8 @@ Full context in `@spec.md`. Phased build with per-phase prompts in `@plan.md`.
 pip install -r requirements.txt
 python -m src.main --mode skeleton            # live hand skeleton over webcam
 python -m src.main --mode image --image assets/test.png   # + pinch-to-grab image
+python -m src.main --mode image --source window --window-title "Notepad"  # grab a live window
+python -m src.main --mode image --source screen --monitor-index 1         # grab a monitor (1-based)
 ```
 Quit with `q`.
 
@@ -26,6 +28,7 @@ src/sources/          # frame producers (Source contract) -> latest frame as num
     base.py           #   Source ABC + SourceError
     webcam.py         #   WebcamSource: live feed, applies the selfie mirror
     image.py          #   ImageSource: loaded BGRA overlay image
+    capture.py        #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
 src/scene.py          # Transform geometry + Layer (source+transform+z_index+selected) + Scene
 src/compositor.py     # alpha-composite layers onto the webcam frame in place, by z-order
 src/interaction.py    # grab/move/resize state machines over the selected layer
@@ -44,5 +47,6 @@ src/sinks/            # frame consumers (Sink contract)
 
 ## Gotchas
 - Prefer MediaPipe Tasks API (`HandLandmarker`, `hand_landmarker.task`) in VIDEO/LIVE_STREAM mode; fall back to legacy `mp.solutions.hands` only if the installed version makes that simpler.
-- Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+). No screen capture (Phase 7) or iPhone/iPad (not planned) yet.
+- Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+).
+- Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Single hand, single image is fine for the MVP.

@@ -7,8 +7,10 @@ selected layer.
 
 Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
 21-point skeleton and a pinch/grab gesture debug label on the mirrored feed.
-Image mode adds one image ``Layer`` you can pinch-grab/move, scale with +/-
-keys, and two-hand-pinch to resize (see ``src.interaction``). Both modes mirror
+Image mode adds one overlay ``Layer`` you can pinch-grab/move, scale with +/-
+keys, and two-hand-pinch to resize (see ``src.interaction``). Its source is
+chosen by ``--source``: a static image (default), a live app ``window`` captured
+by title, or a monitor ``screen`` (Windows Graphics Capture). Both modes mirror
 the feed (in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a
 small HUD (mode/FPS/gesture/key legend), and quit on 'q'. Optionally (``
 --virtualcam`` or the 'v' key) the same composited+HUD frame is also broadcast
@@ -31,7 +33,14 @@ from src.interaction import InteractionState, step
 from src.scene import Layer, Scene, Transform
 from src.sinks import PreviewSink, SinkError, VirtualCamSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
-from src.sources import ImageSource, SourceError, WebcamSource
+from src.sources import (
+    ImageSource,
+    MonitorSource,
+    Source,
+    SourceError,
+    WebcamSource,
+    WindowSource,
+)
 
 WINDOW_NAME = "handy"
 QUIT_KEY = "q"
@@ -40,6 +49,23 @@ WAIT_KEY_DELAY_MS = 1
 MODE_SKELETON = "skeleton"
 MODE_IMAGE = "image"
 MODES = (MODE_SKELETON, MODE_IMAGE)
+
+# Image-mode overlay source. 'image' is a static file; 'window' captures a live
+# app window by title substring; 'screen' captures a monitor (Windows Graphics
+# Capture). Only meaningful in image mode -- skeleton mode has no layers.
+SOURCE_IMAGE = "image"
+SOURCE_WINDOW = "window"
+SOURCE_SCREEN = "screen"
+SOURCES = (SOURCE_IMAGE, SOURCE_WINDOW, SOURCE_SCREEN)
+LIVE_SOURCES = (SOURCE_WINDOW, SOURCE_SCREEN)
+
+# windows-capture indexes monitors 1-based (1 = primary); index 0 is rejected.
+DEFAULT_MONITOR_INDEX = 1
+
+# A captured window/monitor is usually far larger than the 640x480 webcam frame;
+# at scale 1.0 it would bury the feed. On the first frame its size is known, fit
+# its width to this fraction of the frame so the webcam stays visible.
+INITIAL_FIT_FRACTION = 0.5
 
 # Number of hands to track in image mode (single hand grabs/moves; two hands
 # pinch-resize).
@@ -67,7 +93,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Webcam hand-tracking debug harness.")
     parser.add_argument("--mode", required=True, choices=MODES, help="Which mode to run.")
     parser.add_argument(
-        "--image", default=None, help="Path to the overlay image (required for --mode image)."
+        "--image",
+        default=None,
+        help="Path to the overlay image (required for --mode image --source image).",
+    )
+    parser.add_argument(
+        "--source",
+        default=SOURCE_IMAGE,
+        choices=SOURCES,
+        help=(
+            "Image-mode overlay source: a static 'image', a live 'window' (by "
+            "title), or a monitor 'screen'. Only valid with --mode image."
+        ),
+    )
+    parser.add_argument(
+        "--window-title",
+        default=None,
+        help="Window title substring to capture (required for --source window).",
+    )
+    parser.add_argument(
+        "--monitor-index",
+        type=int,
+        default=DEFAULT_MONITOR_INDEX,
+        help="1-based monitor index for --source screen (1 = primary display).",
     )
     parser.add_argument(
         "--debug-skeleton",
@@ -85,8 +133,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
-    if args.mode == MODE_IMAGE and not args.image:
-        parser.error("--image is required when --mode is 'image'")
+    if args.source in LIVE_SOURCES and args.mode != MODE_IMAGE:
+        parser.error("--source window/screen is only valid with --mode image")
+    if args.mode == MODE_IMAGE and args.source == SOURCE_IMAGE and not args.image:
+        parser.error("--image is required when --mode is 'image' and --source is 'image'")
+    if args.source == SOURCE_WINDOW and not args.window_title:
+        parser.error("--window-title is required when --source is 'window'")
 
     return args
 
@@ -184,24 +236,80 @@ def _handle_image_key(
     return scene, interaction
 
 
+def _build_layer_source(args: argparse.Namespace) -> Source:
+    """Build and open the image-mode overlay source for the selected --source.
+
+    Returns an already-open ``Source``. Fails fast with ``SourceError`` on a bad
+    image path, a window whose title isn't found, or a bad monitor index -- the
+    live sources start their capture thread here, so this is the last step in
+    ``_init_mode`` that can fail (nothing risky follows the thread start).
+    """
+    if args.source == SOURCE_WINDOW:
+        return WindowSource(args.window_title).open()
+    if args.source == SOURCE_SCREEN:
+        return MonitorSource(args.monitor_index).open()
+    return ImageSource.load(args.image)  # fail fast on a bad image path
+
+
+def _apply_pending_fit(
+    scene: Scene, fit_pending: bool, frame_size: Tuple[int, int]
+) -> Tuple[Scene, bool]:
+    """Apply the one-time initial fit of a live layer once its size is known.
+
+    Returns the (possibly updated) scene and the new ``fit_pending`` flag.
+    No-op when no fit is pending or nothing is selected; when the selected
+    layer's size isn't known yet (no captured frame so far) the fit stays
+    pending and is retried next frame. Extracted from the loop so the
+    exactly-once semantics are unit-testable without a camera.
+    """
+    if not fit_pending:
+        return scene, False
+    layer = scene.selected_layer
+    if layer is None:
+        return scene, fit_pending
+    fitted = _fit_layer_to_frame(layer, frame_size)
+    if fitted is None:
+        return scene, True
+    return scene.replace_selected(fitted), False
+
+
+def _fit_layer_to_frame(layer: Layer, frame_size: Tuple[int, int]) -> Optional[Layer]:
+    """Return ``layer`` rescaled to ~``INITIAL_FIT_FRACTION`` of the frame width.
+
+    Returns ``None`` when the layer's size isn't known yet (a live capture
+    source reports no size until its first frame arrives) so the caller can try
+    again next frame. Only the scale changes; the center is left at the default.
+    """
+    base = layer.base_size
+    if base is None:
+        return None
+    base_w, _ = base
+    if base_w <= 0:
+        return None
+    frame_w, _ = frame_size
+    target_scale = (frame_w * INITIAL_FIT_FRACTION) / base_w
+    return layer.with_transform(layer.transform.with_scale(target_scale))
+
+
 def _init_mode(args: argparse.Namespace):
     """Build per-mode state BEFORE opening the camera.
 
     Returns ``(tracker, detectors, scene, interaction)``. Skeleton mode gets a
     single detector and an empty scene (no image layer, so the compositor is a
-    no-op); ``interaction`` is None there. Image mode loads the overlay image
-    first -- so a missing/unreadable file fails fast, before any camera or model
-    work -- and builds a single-layer selected scene. Exits nonzero with a clear
-    message on image/tracker init failure.
+    no-op); ``interaction`` is None there. Image mode builds tracker/detectors
+    first, then opens the overlay source LAST (a bad image path, unfound window,
+    or bad monitor index fails fast here -- and, for live sources, the capture
+    thread only starts once nothing risky follows), then a single-layer selected
+    scene. Exits nonzero with a clear message on source/tracker init failure.
     """
     try:
         if args.mode == MODE_SKELETON:
             tracker = HandTracker()
             return tracker, [GestureDetector()], Scene(), None
 
-        source = ImageSource.load(args.image)  # fail fast on a bad image path
         tracker = HandTracker(num_hands=IMAGE_MODE_NUM_HANDS)
         detectors = [GestureDetector() for _ in range(IMAGE_MODE_NUM_HANDS)]
+        source = _build_layer_source(args)  # last step that can fail
         scene = Scene.single(Layer(source=source, transform=Transform()))
         return tracker, detectors, scene, InteractionState.initial()
     except (HandTrackerError, SourceError) as exc:
@@ -238,6 +346,12 @@ def run(args: argparse.Namespace) -> None:
     virtualcam_active = args.virtualcam
     virtualcam_ever_sent = False
 
+    # Live window/screen layers report no size until their first frame arrives,
+    # so their initial fit is applied lazily in the loop (once) rather than at
+    # construction. Static image layers already know their size and keep the
+    # historical scale-1.0 behavior, so no fit is pending for them.
+    fit_pending = args.mode == MODE_IMAGE and args.source in LIVE_SOURCES
+
     try:
         with WebcamSource() as webcam:
             fps_counter = FpsCounter()
@@ -257,6 +371,10 @@ def run(args: argparse.Namespace) -> None:
 
                 if args.mode == MODE_IMAGE:
                     frame_size = (frame.shape[1], frame.shape[0])
+                    # One-time initial fit of a live layer, retried until its
+                    # first captured frame provides a size. Runs BEFORE step()
+                    # so grab/move/resize act on the fitted layer from the start.
+                    scene, fit_pending = _apply_pending_fit(scene, fit_pending, frame_size)
                     # Image mode always keeps exactly one layer selected; the
                     # guard makes that invariant explicit rather than crashing
                     # inside step() if it's ever broken.
@@ -316,6 +434,10 @@ def run(args: argparse.Namespace) -> None:
             tracker.close()
         preview.close()
         virtualcam.close()
+        # Release any layer sources (stops live window/screen capture threads;
+        # a no-op for image layers). Empty in skeleton mode.
+        for layer in scene.layers:
+            layer.source.close()
 
 
 def main(argv=None) -> None:

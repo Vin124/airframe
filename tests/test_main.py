@@ -7,15 +7,23 @@ webcam/display access happens until run() is called).
 
 import pytest
 
+import src.main
 from src.interaction import GrabState, InteractionState, ResizeState
 from src.main import (
+    INITIAL_FIT_FRACTION,
     MODE_IMAGE,
     MODE_SKELETON,
     RESET_TRANSFORM_KEY,
     SCALE_DOWN_KEYS,
     SCALE_UP_KEYS,
+    SOURCE_IMAGE,
+    SOURCE_SCREEN,
+    SOURCE_WINDOW,
     TOGGLE_SKELETON_KEY,
     TOGGLE_VIRTUALCAM_KEY,
+    _apply_pending_fit,
+    _build_layer_source,
+    _fit_layer_to_frame,
     _handle_image_key,
     _pump_virtualcam,
     _toggle_skeleton,
@@ -24,6 +32,7 @@ from src.main import (
 )
 from src.scene import Layer, Scene, Transform
 from src.sinks import SinkError
+from src.sources import ImageSource
 from src.sources.base import Size, Source
 
 
@@ -83,6 +92,73 @@ def test_virtualcam_flag_defaults_false():
 def test_virtualcam_flag_can_be_enabled():
     args = parse_args(["--mode", "skeleton", "--virtualcam"])
     assert args.virtualcam is True
+
+
+# --------------------------------------------------------------------------- #
+# --source / --window-title / --monitor-index parsing + validation
+# --------------------------------------------------------------------------- #
+
+def test_source_defaults_to_image():
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    assert args.source == SOURCE_IMAGE
+    assert args.monitor_index == 1  # 1-based default (windows-capture rejects 0)
+
+
+def test_source_window_parses_with_title():
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "Notepad"])
+    assert args.source == SOURCE_WINDOW
+    assert args.window_title == "Notepad"
+
+
+def test_source_window_without_title_is_rejected():
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "image", "--source", "window"])
+
+
+def test_source_window_does_not_require_image():
+    # --image is only required for --source image; a window source stands in for it.
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "X"])
+    assert args.image is None
+
+
+def test_source_screen_parses_monitor_index():
+    args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "2"])
+    assert args.source == SOURCE_SCREEN
+    assert args.monitor_index == 2
+
+
+def test_source_screen_does_not_require_image():
+    args = parse_args(["--mode", "image", "--source", "screen"])
+    assert args.image is None
+    assert args.monitor_index == 1
+
+
+def test_live_source_rejected_outside_image_mode():
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "skeleton", "--source", "window", "--window-title", "X"])
+
+
+def test_image_source_still_requires_image():
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "image", "--source", "image"])
+
+
+# --------------------------------------------------------------------------- #
+# Initial fit of a live (large) layer to ~half the frame width
+# --------------------------------------------------------------------------- #
+
+def test_fit_layer_scales_to_half_frame_width():
+    # A 1600px-wide source in a 640px frame -> width ~= 320px -> scale 0.2.
+    layer = Layer(source=_FakeSource(base_size=(1600, 900)))
+    fitted = _fit_layer_to_frame(layer, (640, 480))
+    assert fitted is not None
+    expected = (640 * INITIAL_FIT_FRACTION) / 1600
+    assert fitted.transform.scale == pytest.approx(expected)
+
+
+def test_fit_layer_returns_none_when_size_unknown():
+    layer = Layer(source=_FakeSource(base_size=None))
+    assert _fit_layer_to_frame(layer, (640, 480)) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -209,3 +285,87 @@ def test_pump_virtualcam_runtime_toggle_failure_is_not_fatal():
     sink = _FakeVirtualCamSink(fail=True)
     active, ever_sent = _pump_virtualcam(sink, "frame", True, False, False)
     assert (active, ever_sent) == (False, False)
+
+
+# --------------------------------------------------------------------------- #
+# _apply_pending_fit: exactly-once fit semantics (loop-extracted helper)
+# --------------------------------------------------------------------------- #
+
+def test_apply_pending_fit_not_pending_is_noop():
+    scene = _scene()
+    result, pending = _apply_pending_fit(scene, False, (640, 480))
+    assert result is scene
+    assert pending is False
+
+
+def test_apply_pending_fit_stays_pending_until_size_known():
+    scene = Scene.single(Layer(source=_FakeSource(base_size=None)))
+    result, pending = _apply_pending_fit(scene, True, (640, 480))
+    assert result is scene
+    assert pending is True
+
+
+def test_apply_pending_fit_applies_once_then_clears_flag():
+    scene = Scene.single(Layer(source=_FakeSource(base_size=(1600, 900))))
+    fitted_scene, pending = _apply_pending_fit(scene, True, (640, 480))
+    assert pending is False
+    expected = (640 * INITIAL_FIT_FRACTION) / 1600
+    assert fitted_scene.selected_layer.transform.scale == pytest.approx(expected)
+    # A second call with the cleared flag must not re-fit (e.g. after resize).
+    resized = fitted_scene.replace_selected(
+        fitted_scene.selected_layer.with_transform(Transform(scale=3.0))
+    )
+    again, pending = _apply_pending_fit(resized, False, (640, 480))
+    assert again is resized
+    assert again.selected_layer.transform.scale == pytest.approx(3.0)
+
+
+def test_apply_pending_fit_with_empty_scene_stays_pending():
+    result, pending = _apply_pending_fit(Scene(), True, (640, 480))
+    assert pending is True
+
+
+# --------------------------------------------------------------------------- #
+# _build_layer_source dispatch (fakes patched in, no real capture started)
+# --------------------------------------------------------------------------- #
+
+def test_build_layer_source_image_builds_image_source():
+    args = parse_args(["--mode", "image", "--image", "assets/test.png"])
+    source = _build_layer_source(args)
+    assert isinstance(source, ImageSource)
+
+
+def test_build_layer_source_window_dispatch(monkeypatch):
+    created = {}
+
+    class _FakeWindowSource:
+        def __init__(self, title):
+            created["title"] = title
+
+        def open(self):
+            created["opened"] = True
+            return self
+
+    monkeypatch.setattr(src.main, "WindowSource", _FakeWindowSource)
+    args = parse_args(["--mode", "image", "--source", "window", "--window-title", "Pad"])
+    source = _build_layer_source(args)
+    assert isinstance(source, _FakeWindowSource)
+    assert created == {"title": "Pad", "opened": True}
+
+
+def test_build_layer_source_screen_dispatch(monkeypatch):
+    created = {}
+
+    class _FakeMonitorSource:
+        def __init__(self, index):
+            created["index"] = index
+
+        def open(self):
+            created["opened"] = True
+            return self
+
+    monkeypatch.setattr(src.main, "MonitorSource", _FakeMonitorSource)
+    args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "2"])
+    source = _build_layer_source(args)
+    assert isinstance(source, _FakeMonitorSource)
+    assert created == {"index": 2, "opened": True}

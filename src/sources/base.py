@@ -13,9 +13,10 @@ Frame format by role:
     compositor can alpha-blend them over the background.
 
 Why pull-based ``read()`` rather than a push callback: it keeps the MVP loop
-dead simple (main loop pulls one frame per source per tick) while leaving room
-for a future threaded source to override ``read()`` with a latest-frame-wins
-buffer (Phase 9) without changing any caller.
+dead simple (main loop pulls one frame per source per tick) while letting a
+threaded source publish into a latest-frame-wins buffer that ``read()`` just
+returns -- exactly what the live capture sources in ``capture.py`` do --
+without changing any caller.
 """
 
 from abc import ABC, abstractmethod

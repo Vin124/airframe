@@ -15,8 +15,9 @@ Mode 2 is a superset of mode 1. Build mode 1 first, fully working, then layer mo
 
 ## Out of scope for MVP Chunk 1 (since lifted by `plan-2.md`)
 Chunk 2 lifts most of the original exclusions: virtual camera output shipped in
-Phase 6 (`--virtualcam` / 'v' key via pyvirtualcam + OBS Virtual Camera);
-window/screen capture and multi-layer manipulation follow in Phases 7-8.
+Phase 6 (`--virtualcam` / 'v' key via pyvirtualcam + OBS Virtual Camera); live
+window/screen capture shipped in Phase 7 (`--source window|screen` via
+windows-capture); multi-layer manipulation follows in Phase 8.
 Still out of scope:
 - iPhone/iPad mirroring
 - Any packaging/installer (Chunk 3)
@@ -52,7 +53,8 @@ shacam-win/
     ├── sources/            # frame producers (Source contract) -> latest frame as numpy array
     │   ├── base.py         #   Source ABC + SourceError
     │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror
-    │   └── image.py        #   ImageSource: loaded BGRA overlay image
+    │   ├── image.py        #   ImageSource: loaded BGRA overlay image
+    │   └── capture.py      #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
     ├── scene.py            # Transform geometry + Layer (source+transform+z_index+selected) + Scene
     ├── compositor.py       # alpha-composite layers onto the webcam frame in place, by z-order
     ├── interaction.py      # grab/move/resize state machines over the selected layer
@@ -67,6 +69,8 @@ shacam-win/
 pip install -r requirements.txt
 python -m src.main --mode skeleton
 python -m src.main --mode image --image assets/test.png
+python -m src.main --mode image --source window --window-title "Notepad"  # live window overlay
+python -m src.main --mode image --source screen --monitor-index 1         # live monitor overlay (1-based)
 ```
 Press `q` to quit. (A runtime key to toggle modes is a nice-to-have, not required.)
 
