@@ -16,6 +16,7 @@ python -m src.main --mode image --image assets/test.png --no-panel  # hotkeys on
 python -m src.main --mode skeleton --min-detection-confidence 0.7 --min-tracking-confidence 0.6  # startup-only MediaPipe confidences
 python -m src.main --mode skeleton --speech    # + always-listening mic transcription printed to console (Phase 12)
 python -m src.main --mode skeleton --speech --parse   # + local-LLM parse of each finalized phrase into a structured request (Phase 13, needs Ollama running)
+python -m src.main --mode image --image assets/test.png --speech --parse --generate   # + GPU image GENERATION for 'generate'-routed requests (Phase 16, needs a CUDA GPU + torch/diffusers)
 ```
 A small **Tkinter control panel** opens alongside the preview by default (Phase
 10): pick a source (image file picker / editable window-title dropdown / monitor
@@ -31,7 +32,9 @@ and pre-fill on start; precedence is **CLI > config > defaults**.
 Persisted config keys: `source`, `image_path`, `window_title`, `monitor_index`,
 `virtualcam`, `speech` (Phase 12 opt-in, `--speech` store_true, remembered like
 `virtualcam`), `parse` (Phase 13 opt-in, `--parse` store_true, remembered the
-same way; only meaningful when `speech` is also on), `pinch_enter` /
+same way; only meaningful when `speech` is also on), `generate` (Phase 16 opt-in,
+`--generate` store_true, remembered the same way; GPU-only, only meaningful when
+`speech` + `parse` are also on), `pinch_enter` /
 `pinch_exit` (live slider thresholds), and `min_detection_confidence` /
 `min_presence_confidence` / `min_tracking_confidence`
 (startup-only MediaPipe knobs, also `--min-*-confidence` flags).
@@ -66,6 +69,7 @@ src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on it
 src/speech.py         # SpeechWorker: mic capture + energy-VAD phrase segmentation + ASR (Moonshine -> faster-whisper fallback) on its own thread (Phase 12); pure VAD + rolling-transcript helpers; deferred deps; speech_session() launch glue
 src/parser.py          # RequestParser: one finalized phrase -> a strict-JSON structured ParsedRequest via a local Ollama model (Phase 13); pure prompt-build + JSON-extract + enum-normalize helpers are the security boundary; OllamaClient speaks Ollama's HTTP API over stdlib urllib (no new dep); wired as (part of) the speech thread's on_phrase callback, see src/launch.py's build_speech_on_phrase
 src/retriever.py       # Retriever: a parsed retrieve request -> a downloaded, decoded BGRA RetrievedAsset (Phase 14). Swappable RetrievalSource backends: WikimediaSource (default, MediaWiki Commons API, stdlib urllib, no dep) -> WebSearchSource (fallback, DuckDuckGo via lazily-imported ddgs) with an optional LocalLibrarySource (filename-substring, CLIP deferred) tried first. select_best_image + decode_to_bgra + is_allowed_url are pure/unit-tested; remote URLs come from search + are only lightly validated (scheme/size/timeout/dim caps). Runs on the SPEECH thread via build_speech_on_phrase; publishes its asset to the Phase 15 PreviewInbox
+src/generator.py       # Image generator (Phase 16, OPTIONAL/GPU, reached via --speech --parse --generate when a parsed request is route="generate"): DiffusionGenerator runs a fast few-step text-to-image model (stabilityai/sdxl-turbo default, fp16/512px, CPU-offload+slicing to fit 8GB; sd-turbo fallback) with ALL torch/diffusers imports DEFERRED + the pipeline LAZY-loaded on first generate. GeneratedAsset is duck-compatible with RetrievedAsset (.bgra/.source_name/.query, + is_placeholder). make_placeholder (pure cv2 "materializing" card) + rgb_to_bgra are pure/unit-tested. RequestGenerator.generate catches EVERYTHING -> None (never raises to the speech thread); no CUDA GPU -> one notice + every generate degrades to None
 src/spawn.py           # Spawn gesture (Phase 15): PreviewInbox (the ONE speech->main atomic hand-off slot) + pure dock geometry (dock_rect/pinch_over_dock/pull_down_distance/spawn_transform) + the advance_spawn state machine (frozen PreviewState: IDLE docked -> GRABBED -> spawn/dismiss) + suppress_spawn_pinch precedence + render_dock (draws the docked preview onto the composited frame). Pure numpy/cv2 except PreviewInbox; no camera/mediapipe/threads. The main loop is the sole scene writer
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
@@ -214,6 +218,29 @@ hand-off, GIL-safe, latest-frame-wins):
   stops. `render_dock` draws the docked preview onto the composited copy AFTER the
   compositor + active stroke, BEFORE the HUD, so it shows in BOTH the preview and
   the virtual cam. All thresholds are module constants in `src/spawn.py`.
+- Image generator (Phase 16, `src/generator.py`, OPT-IN + GPU-ONLY via `--speech
+  --parse --generate`): a parsed `route="generate"` request (an imagined/described
+  thing) runs a fast few-step diffusion model on the GPU and spawns the result
+  through the EXACT SAME Phase 15 path as a retrieved image (`GeneratedAsset` is
+  duck-compatible with `RetrievedAsset`). `--generate` is off by default and only
+  acted on with `--speech --parse`; a generate request with the flag OFF logs
+  `[generator] disabled (pass --generate)` and is ignored, so RETRIEVAL stays the
+  default for real, nameable things. ALL torch/diffusers imports are DEFERRED and
+  the diffusion pipeline LAZY-loads on the FIRST generate, so (a) the base app +
+  every other phase import/run with NEITHER installed and (b) merely enabling the
+  flag doesn't hold ~7 GB VRAM for a session that never generates -- but the FIRST
+  generate is SLOW (model download on a cold cache + load). No CUDA GPU (or
+  torch/diffusers absent) -> ONE clear stderr notice + every generate degrades to
+  `None` (never a crash). Flow: `build_speech_on_phrase` publishes a
+  `make_placeholder(query)` "materializing" card to the `PreviewInbox` IMMEDIATELY
+  (docks at once), runs `RequestGenerator.generate` (blocks seconds on the GPU,
+  ON THE SPEECH THREAD), then publishes the finished image which REPLACES the
+  placeholder via the inbox's latest-wins slot; on failure the placeholder is left
+  to auto-dismiss. Targets an 8 GB card (RTX 4060): `stabilityai/sdxl-turbo`
+  (fp16, 512 px, `enable_model_cpu_offload` + VAE/attention slicing) by default,
+  `stabilityai/sd-turbo` (~2.5 GB) as the lighter fallback if it OOMs; the model
+  id is a module constant. Install the optional torch(CUDA)/diffusers/transformers/
+  accelerate/safetensors block from `requirements.txt`.
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
   confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it

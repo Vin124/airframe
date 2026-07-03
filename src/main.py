@@ -747,7 +747,7 @@ def run(args: argparse.Namespace) -> None:
         # Speech (Phase 12) runs on its OWN thread. Phase 13/14: when --parse is
         # on, its finalized-phrase callback parses + retrieves ON THE SPEECH
         # THREAD and publishes any asset to the inbox (Phase 15). None = default.
-        on_phrase = build_speech_on_phrase(prefill["parse"], inbox)
+        on_phrase = build_speech_on_phrase(prefill["parse"], inbox, prefill["generate"])
         with speech_session(prefill["speech"], on_phrase=on_phrase):
             runtime.run()
     except CameraError as exc:
@@ -778,7 +778,7 @@ def run(args: argparse.Namespace) -> None:
             config.CONFIG_FILENAME,
             _final_settings(
                 panel, args, vcam_state, tuning_state, confidence,
-                prefill["speech"], prefill["parse"],
+                prefill["speech"], prefill["parse"], prefill["generate"],
             ),
         )
         if panel is not None:

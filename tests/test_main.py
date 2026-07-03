@@ -186,6 +186,48 @@ def test_final_settings_persists_parse():
     assert off["parse"] is False
 
 
+# --------------------------------------------------------------------------- #
+# --generate flag (Phase 16): parsing + config/prefill resolution + persistence
+# --------------------------------------------------------------------------- #
+
+def test_generate_flag_defaults_false():
+    assert parse_args(["--mode", "skeleton"]).generate is False
+
+
+def test_generate_flag_can_be_enabled():
+    assert parse_args(["--mode", "skeleton", "--generate"]).generate is True
+
+
+def test_resolve_prefill_generate_cli_forces_on():
+    args = parse_args(["--mode", "skeleton", "--generate"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["generate"] is True
+
+
+def test_resolve_prefill_generate_from_config_when_cli_off():
+    args = parse_args(["--mode", "skeleton"])  # no --generate
+    pf = resolve_panel_prefill(args, {"generate": True})
+    assert pf["generate"] is True  # remembered config value carries
+
+
+def test_resolve_prefill_generate_defaults_off():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["generate"] is False
+
+
+def test_final_settings_persists_generate():
+    args = parse_args(["--mode", "skeleton"])
+    on = _final_settings(
+        None, args, False, _TUNING, _CONFIDENCE, speech=True, parse=True, generate=True
+    )
+    off = _final_settings(
+        None, args, False, _TUNING, _CONFIDENCE, speech=True, parse=True, generate=False
+    )
+    assert on["generate"] is True
+    assert off["generate"] is False
+
+
 def test_build_speech_on_phrase_none_when_parse_off():
     from src.launch import build_speech_on_phrase
 

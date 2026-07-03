@@ -20,6 +20,7 @@ def test_default_config_has_expected_keys_and_values():
         "virtualcam": False,
         "speech": False,
         "parse": False,
+        "generate": False,
         "pinch_enter": 0.05,
         "pinch_exit": 0.07,
         "min_detection_confidence": 0.5,
@@ -44,6 +45,7 @@ def test_merge_overlays_loaded_values_over_defaults():
             "virtualcam": True,
             "speech": True,
             "parse": True,
+            "generate": True,
             "pinch_enter": 0.04,
             "pinch_exit": 0.09,
             "min_detection_confidence": 0.6,
@@ -59,6 +61,7 @@ def test_merge_overlays_loaded_values_over_defaults():
         "virtualcam": True,
         "speech": True,
         "parse": True,
+        "generate": True,
         "pinch_enter": 0.04,
         "pinch_exit": 0.09,
         "min_detection_confidence": 0.6,
@@ -99,6 +102,18 @@ def test_merge_rejects_non_bool_parse():
     assert config.merge_config({"parse": "yes"})["parse"] is False  # falls back
 
 
+def test_merge_accepts_generate_bool():
+    assert config.merge_config({"generate": True})["generate"] is True
+
+
+def test_merge_rejects_non_bool_generate():
+    assert config.merge_config({"generate": "yes"})["generate"] is False  # falls back
+
+
+def test_generate_defaults_off():
+    assert config.default_config()["generate"] is False
+
+
 def test_merge_rejects_bool_and_out_of_range_monitor_index():
     assert config.merge_config({"monitor_index": True})["monitor_index"] == 1
     assert config.merge_config({"monitor_index": 0})["monitor_index"] == 1
@@ -132,6 +147,7 @@ def test_save_then_load_roundtrips(tmp_path):
         "virtualcam": True,
         "speech": True,
         "parse": True,
+        "generate": True,
         "pinch_enter": 0.04,
         "pinch_exit": 0.09,
         "min_detection_confidence": 0.6,

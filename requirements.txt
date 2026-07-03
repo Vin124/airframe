@@ -33,3 +33,20 @@ windows-capture
 # fallback and prints one notice:
 #   pip install ddgs
 # ddgs: keyless DuckDuckGo search (the maintained successor to duckduckgo_search).
+
+# --- Optional: image generator (Phase 16, run with --speech --parse --generate).
+# GPU-ONLY and opt-in: a parsed 'generate'-routed request runs a fast few-step
+# diffusion model on the GPU and spawns the result like a retrieved image. The
+# base pipeline and every other phase import/run WITHOUT any of these installed
+# (torch/diffusers are imported lazily inside src/generator.py, only when
+# --generate is passed). Needs an 8 GB+ CUDA GPU. Install the CUDA torch build
+# from the official index, then the diffusers stack:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install diffusers transformers accelerate safetensors
+# torch: the CUDA build (match your CUDA runtime; cu124 shown for a modern NVIDIA).
+# diffusers: the text-to-image pipeline (stabilityai/sdxl-turbo by default, fp16,
+#   512 px, few-step; falls back to the lighter stabilityai/sd-turbo if OOM).
+# transformers: the model's text encoder(s). accelerate: enables
+#   enable_model_cpu_offload so the model fits 8 GB. safetensors: fast/safe
+#   weight loading. The first generate is SLOW (model download + load); with no
+#   CUDA GPU the generator prints one notice and generate requests are ignored.

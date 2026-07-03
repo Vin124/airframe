@@ -67,6 +67,9 @@ def resolve_panel_prefill(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict
         # Parser opt-in (Phase 13): same store_true precedence as --speech. Only
         # acted on when speech is also on (see build_speech_on_phrase).
         "parse": bool(args.parse or cfg.get("parse", False)),
+        # Generator opt-in (Phase 16, GPU-only): same store_true precedence. Only
+        # acted on when speech + parse are also on (see build_speech_on_phrase).
+        "generate": bool(args.generate or cfg.get("generate", False)),
         # Pinch tuning has no CLI flag (it's the live sliders): config > default.
         # cfg already validated/clamped these through merge_config.
         "pinch_enter": cfg.get("pinch_enter", DEFAULT_PINCH_ENTER),
@@ -134,6 +137,7 @@ def _final_settings(
     confidence: TrackerConfidence,
     speech: bool = False,
     parse: bool = False,
+    generate: bool = False,
 ) -> Dict[str, Any]:
     """The settings dict persisted on exit.
 
@@ -143,13 +147,14 @@ def _final_settings(
     stale. Falls back to args-derived settings when no panel was built. The pinch
     ``tuning`` (runtime-authoritative, driven by the sliders), the startup
     ``confidence`` (never changes at runtime), and the resolved ``speech`` /
-    ``parse`` opt-ins are overlaid last so all round-trip -- the panel has no
-    widget for any of them.
+    ``parse`` / ``generate`` opt-ins are overlaid last so all round-trip -- the
+    panel has no widget for any of them.
     """
     settings = _config_from_args(args, vcam_state) if panel is None else panel.current_settings()
     settings["virtualcam"] = bool(vcam_state)
     settings["speech"] = bool(speech)
     settings["parse"] = bool(parse)
+    settings["generate"] = bool(generate)
     settings["pinch_enter"] = tuning.enter
     settings["pinch_exit"] = tuning.exit
     settings["min_detection_confidence"] = confidence.detection
@@ -159,42 +164,51 @@ def _final_settings(
 
 
 def build_speech_on_phrase(
-    parse_enabled: bool, inbox: Optional["PreviewInbox"] = None
+    parse_enabled: bool,
+    inbox: Optional["PreviewInbox"] = None,
+    generate_enabled: bool = False,
 ) -> Optional["PhraseCallback"]:
-    """Compose the speech ``on_phrase`` callback (the Phase 13/14/15 wiring seam).
+    """Compose the speech ``on_phrase`` callback (the Phase 13/14/15/16 wiring seam).
 
     Returns ``None`` when parsing is off, so ``speech_session`` keeps its default
     callback (which prints the live ``[speech]`` transcript). When on, returns a
     callback that prints that live transcript, runs the LLM parser (logging
-    ``[parser] {...}`` for actionable phrases only), and -- for ``retrieve``-routed
-    requests (Phase 14) -- fetches the image and logs ``[retriever] got <WxH>
-    image for '<query>' from <source>`` (or ``[retriever] no image for
-    '<query>'``). Non-actionable / failed parses return ``None`` and are ignored;
-    ``generate``-routed requests are left for Phase 16.
+    ``[parser] {...}`` for actionable phrases only), then routes each actionable
+    request:
+      - ``retrieve`` (Phase 14): fetch the image and log ``[retriever] got <WxH>
+        image ...`` (or ``[retriever] no image ...``).
+      - ``generate`` (Phase 16): only when ``generate_enabled`` -- dock a
+        "materializing" placeholder at once, run the GPU generator, then publish
+        the finished image (which REPLACES the placeholder). Logs ``[generator]
+        generated <WxH> for '<query>'`` / ``[generator] failed ...``. With
+        ``--generate`` OFF a generate request logs ``[generator] disabled (pass
+        --generate) ...`` and is ignored (retrieval stays the default).
 
-    Phase 15: when an ``inbox`` (``PreviewInbox``) is supplied, a fetched asset is
+    Phase 15: when an ``inbox`` (``PreviewInbox``) is supplied, a produced asset is
     ALSO published to it (in addition to the log line) so the main loop can dock it
     as a spawnable preview. With ``inbox=None`` this behaves exactly as before
-    (log-only), so the Phase 13/14 unit tests are unaffected.
+    (log-only), so the earlier-phase unit tests are unaffected.
 
     THREADING: this callback runs on the SPEECH thread (``SpeechWorker`` invokes
-    ``on_phrase`` there, never the render loop). Both ``RequestParser.parse`` and
-    ``Retriever.retrieve`` BLOCK on the network for up to their bounded timeouts,
-    which is fine off the render thread and can't stall render/tracking FPS; the
-    worker's bounded ``stop()`` join keeps a slow call from wedging shutdown. The
-    ``inbox.publish`` is a single atomic reference store (no lock) -- the speech
-    thread never touches scene/interaction, only drops the asset in the slot. The
-    parser/retriever/speech imports are deferred so a headless import of this
-    module (and its unit tests) doesn't pull them in.
+    ``on_phrase`` there, never the render loop). ``RequestParser.parse``,
+    ``Retriever.retrieve`` and ``RequestGenerator.generate`` all BLOCK (network /
+    GPU) for up to their bounded budgets, which is fine off the render thread and
+    can't stall render/tracking FPS; the worker's bounded ``stop()`` join keeps a
+    slow call from wedging shutdown. Each ``inbox.publish`` is a single atomic
+    reference store (no lock) -- the speech thread never touches scene/interaction,
+    only drops the asset in the slot. The parser/retriever/generator/speech imports
+    are deferred so a headless import of this module (and its unit tests) doesn't
+    pull them (or torch/diffusers) in.
     """
     if not parse_enabled:
         return None
-    from src.parser import ROUTE_RETRIEVE, build_request_parser
+    from src.parser import ROUTE_GENERATE, build_request_parser
     from src.retriever import build_retriever
     from src.speech import default_on_phrase
 
     parser = build_request_parser()
     retriever = build_retriever()
+    generator = _build_request_generator() if generate_enabled else None
 
     def on_phrase(text: str) -> None:
         default_on_phrase(text)  # preserve the Phase 12 live-transcript line
@@ -202,21 +216,63 @@ def build_speech_on_phrase(
         if request is None or not request.is_actionable:
             return
         print(f"[parser] {request}")
-        if request.route != ROUTE_RETRIEVE:
-            return  # generate-routed requests are Phase 16, nothing to fetch here
-        asset = retriever.retrieve(request)
-        if asset is None:
-            print(f"[retriever] no image for '{request.query}'")
-            return
-        height, width = asset.bgra.shape[:2]
-        print(
-            f"[retriever] got {width}x{height} image for "
-            f"'{request.query}' from {asset.source_name}"
-        )
-        if inbox is not None:
-            inbox.publish(asset)  # Phase 15: hand it to the main loop to dock
+        if request.route == ROUTE_GENERATE:
+            _run_generate(request, generator, inbox)
+        else:
+            _run_retrieve(request, retriever, inbox)
 
     return on_phrase
+
+
+def _build_request_generator():
+    """Compose the Phase 16 ``RequestGenerator`` (deferred import; probes the GPU)."""
+    from src.generator import build_request_generator
+
+    return build_request_generator()
+
+
+def _run_retrieve(request, retriever, inbox: Optional["PreviewInbox"]) -> None:
+    """Fetch + log a ``retrieve`` request and publish any asset (SPEECH thread)."""
+    asset = retriever.retrieve(request)
+    if asset is None:
+        print(f"[retriever] no image for '{request.query}'")
+        return
+    height, width = asset.bgra.shape[:2]
+    print(
+        f"[retriever] got {width}x{height} image for "
+        f"'{request.query}' from {asset.source_name}"
+    )
+    if inbox is not None:
+        inbox.publish(asset)  # Phase 15: hand it to the main loop to dock
+
+
+def _run_generate(request, generator, inbox: Optional["PreviewInbox"]) -> None:
+    """Generate + log a ``generate`` request (SPEECH thread); placeholder then result.
+
+    With no generator (``--generate`` off) the request is ignored with a notice.
+    Otherwise a "materializing" placeholder docks IMMEDIATELY, generation blocks
+    on the GPU, and on success the finished image is published -- REPLACING the
+    placeholder via the inbox's latest-wins slot. On failure the placeholder is
+    left to auto-dismiss (Phase 15's timer). Never raises to the speech thread.
+    """
+    query = request.query
+    if generator is None:
+        print(f"[generator] disabled (pass --generate) for '{query}'")
+        return
+    if inbox is not None:
+        from src.generator import GeneratedAsset, make_placeholder
+
+        inbox.publish(
+            GeneratedAsset(bgra=make_placeholder(query), query=query, is_placeholder=True)
+        )
+    asset = generator.generate(query)
+    if asset is None:
+        print(f"[generator] failed for '{query}'")
+        return
+    height, width = asset.bgra.shape[:2]
+    print(f"[generator] generated {width}x{height} for '{query}'")
+    if inbox is not None:
+        inbox.publish(asset)  # Phase 15: replaces the placeholder (latest-wins)
 
 
 def _build_panel(runtime: "PipelineRuntime", prefill: Dict[str, Any]) -> Optional["ControlPanel"]:
@@ -300,6 +356,19 @@ def parse_args(argv=None) -> argparse.Namespace:
             "Ollama model and print it to the console. Only meaningful with "
             "--speech; needs Ollama running + a small model pulled (qwen2.5:1.5b). "
             "Off by default; the last state is remembered in the config."
+        ),
+    )
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help=(
+            "Enable the Phase 16 image GENERATOR: a parsed 'generate'-routed "
+            "request (an imagined/described thing) runs a fast few-step diffusion "
+            "model on the GPU and spawns the result like a retrieved image. Only "
+            "meaningful with --speech --parse; needs a CUDA GPU + the optional "
+            "torch/diffusers block (see requirements.txt). Off by default; the "
+            "last state is remembered in the config. Retrieval stays the default "
+            "for real, nameable things."
         ),
     )
     parser.add_argument(
