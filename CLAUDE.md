@@ -30,8 +30,9 @@ src/scene.py          # Transform geometry + Layer (source+transform+z_index+sel
 src/compositor.py     # alpha-composite layers onto the webcam frame in place, by z-order
 src/interaction.py    # grab/move/resize state machines over the selected layer
 src/sinks/            # frame consumers (Sink contract)
-    base.py           #   Sink ABC
+    base.py           #   Sink ABC + SinkError
     preview.py        #   PreviewSink: cv2.imshow window
+    virtualcam.py     #   VirtualCamSink: pyvirtualcam broadcast (OBS backend)
 ```
 
 ## Conventions
@@ -43,5 +44,5 @@ src/sinks/            # frame consumers (Sink contract)
 
 ## Gotchas
 - Prefer MediaPipe Tasks API (`HandLandmarker`, `hand_landmarker.task`) in VIDEO/LIVE_STREAM mode; fall back to legacy `mp.solutions.hands` only if the installed version makes that simpler.
-- No virtual camera, screen capture, or iPhone/iPad in this MVP - display in an OpenCV window only.
+- Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+). No screen capture (Phase 7) or iPhone/iPad (not planned) yet.
 - Single hand, single image is fine for the MVP.

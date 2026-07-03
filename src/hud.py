@@ -35,7 +35,10 @@ GESTURE_LABEL_NONE = "--"  # no hand currently tracked
 STATUS_GRABBED = "GRABBED"
 STATUS_RESIZING = "RESIZING"
 
-KEY_LEGEND = "q quit | s skeleton | r reset | +/- scale"
+VIRTUALCAM_ON = "ON"
+VIRTUALCAM_OFF = "OFF"
+
+KEY_LEGEND = "q quit | s skeleton | r reset | +/- scale | v virtualcam"
 
 _NO_FPS_TEXT = "--"
 
@@ -75,12 +78,17 @@ def build_hud_lines(
     fps: Optional[float],
     gesture: str,
     status: Optional[str] = None,
+    virtualcam_active: Optional[bool] = None,
 ) -> List[str]:
     """Compose the HUD's text lines, in top-to-bottom draw order.
 
     ``fps`` is the last reported FpsCounter value (may be None before the
     first one-second window elapses). ``status`` is extra image-mode state
     (e.g. "GRABBED", "RESIZING"); omitted from the HUD when None.
+    ``virtualcam_active`` shows the live on/off state of the virtual-camera
+    sink (Phase 6); omitted entirely when None (e.g. callers/tests that don't
+    care about it), shown as "ON"/"OFF" otherwise so it's always visible
+    whenever the caller tracks the toggle.
     """
     fps_text = f"{fps:.1f}" if fps is not None else _NO_FPS_TEXT
     lines = [
@@ -90,6 +98,8 @@ def build_hud_lines(
     ]
     if status:
         lines.append(f"Status: {status}")
+    if virtualcam_active is not None:
+        lines.append(f"VirtualCam: {VIRTUALCAM_ON if virtualcam_active else VIRTUALCAM_OFF}")
     lines.append(KEY_LEGEND)
     return lines
 

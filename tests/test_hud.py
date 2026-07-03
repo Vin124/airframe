@@ -8,6 +8,8 @@ from src.hud import (
     KEY_LEGEND,
     STATUS_GRABBED,
     STATUS_RESIZING,
+    VIRTUALCAM_OFF,
+    VIRTUALCAM_ON,
     build_hud_lines,
     gesture_label,
     resize_or_grab_status,
@@ -85,4 +87,30 @@ def test_build_hud_lines_status_included_when_present():
     lines = build_hud_lines("image", 60.0, GESTURE_LABEL_PINCH, status=STATUS_GRABBED)
     assert f"Status: {STATUS_GRABBED}" in lines
     # Legend still comes last even with an extra status line.
+    assert lines[-1] == KEY_LEGEND
+
+
+def test_build_hud_lines_virtualcam_omitted_by_default():
+    lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN)
+    assert not any(line.startswith("VirtualCam:") for line in lines)
+
+
+def test_build_hud_lines_virtualcam_on():
+    lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=True)
+    assert f"VirtualCam: {VIRTUALCAM_ON}" in lines
+    assert lines[-1] == KEY_LEGEND
+
+
+def test_build_hud_lines_virtualcam_off():
+    lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=False)
+    assert f"VirtualCam: {VIRTUALCAM_OFF}" in lines
+    assert lines[-1] == KEY_LEGEND
+
+
+def test_build_hud_lines_virtualcam_and_status_both_present_before_legend():
+    lines = build_hud_lines(
+        "image", 60.0, GESTURE_LABEL_GRAB, status=STATUS_GRABBED, virtualcam_active=True
+    )
+    assert f"Status: {STATUS_GRABBED}" in lines
+    assert f"VirtualCam: {VIRTUALCAM_ON}" in lines
     assert lines[-1] == KEY_LEGEND

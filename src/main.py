@@ -10,7 +10,10 @@ Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
 Image mode adds one image ``Layer`` you can pinch-grab/move, scale with +/-
 keys, and two-hand-pinch to resize (see ``src.interaction``). Both modes mirror
 the feed (in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a
-small HUD (mode/FPS/gesture/key legend), and quit on 'q'.
+small HUD (mode/FPS/gesture/key legend), and quit on 'q'. Optionally (``
+--virtualcam`` or the 'v' key) the same composited+HUD frame is also broadcast
+to a virtual webcam via ``VirtualCamSink`` so it can be selected as a camera in
+Zoom/Teams/Meet.
 """
 
 import argparse
@@ -26,7 +29,7 @@ from src.gestures import GestureDetector, GestureState
 from src.hand_tracker import HandTracker, HandTrackerError
 from src.interaction import InteractionState, step
 from src.scene import Layer, Scene, Transform
-from src.sinks import PreviewSink
+from src.sinks import PreviewSink, SinkError, VirtualCamSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
 from src.sources import ImageSource, SourceError, WebcamSource
 
@@ -52,9 +55,11 @@ SCALE_DOWN_KEYS = (ord("-"), ord("_"))
 # Runtime toggle keys. 's' flips skeleton-overlay drawing on/off in both
 # modes (skeleton mode: the skeleton + gesture debug label; image mode: same,
 # gated the same way --debug-skeleton was). 'r' is image-mode only: resets
-# the transform/grab/resize back to the initial centered state.
+# the transform/grab/resize back to the initial centered state. 'v' flips the
+# virtual-camera sink on/off live, independent of mode.
 TOGGLE_SKELETON_KEY = ord("s")
 RESET_TRANSFORM_KEY = ord("r")
+TOGGLE_VIRTUALCAM_KEY = ord("v")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -68,6 +73,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--debug-skeleton",
         action="store_true",
         help="In image mode, also draw the hand skeleton + gesture label.",
+    )
+    parser.add_argument(
+        "--virtualcam",
+        action="store_true",
+        help=(
+            "Also broadcast the composited frame to a virtual webcam (OBS "
+            "Virtual Camera backend required) so it can be selected as a "
+            "camera in Zoom/Teams/Meet."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -107,6 +121,40 @@ def _toggle_skeleton(key: int, show_skeleton: bool) -> bool:
     if key == TOGGLE_SKELETON_KEY:
         return not show_skeleton
     return show_skeleton
+
+
+def _toggle_virtualcam(key: int, active: bool) -> bool:
+    """Flip virtual-cam broadcasting on the 'v' key; otherwise unchanged."""
+    if key == TOGGLE_VIRTUALCAM_KEY:
+        return not active
+    return active
+
+
+def _pump_virtualcam(
+    virtualcam: VirtualCamSink,
+    frame,
+    active: bool,
+    ever_sent: bool,
+    requested_at_launch: bool,
+) -> Tuple[bool, bool]:
+    """Send ``frame`` to the virtual cam when active; degrade gracefully on failure.
+
+    Returns the updated ``(active, ever_sent)`` pair. A ``SinkError`` on the
+    very first launch-requested send is fatal (``exit(1)``, matching
+    ``_init_mode``'s fail-fast-before-real-work behavior); any later failure --
+    or a failure of a runtime 'v' toggle that was never requested at launch --
+    prints to stderr and turns the toggle off, keeping the live session alive.
+    """
+    if not active:
+        return active, ever_sent
+    try:
+        virtualcam.send(frame)
+        return True, True
+    except SinkError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if requested_at_launch and not ever_sent:
+            sys.exit(1)
+        return False, ever_sent
 
 
 def _handle_image_key(
@@ -169,12 +217,26 @@ def run(args: argparse.Namespace) -> None:
     the 's' key flips it at runtime in both modes. ``last_fps`` holds the most
     recent FpsCounter reading for the HUD, since ``tick()`` only returns a fresh
     value once per reporting interval and None otherwise.
+
+    ``virtualcam`` is always constructed (cheap; it does nothing until a frame
+    is sent) so ``close()`` in ``finally`` is always safe to call.
+    ``virtualcam_active`` starts from ``--virtualcam`` and flips on the 'v'
+    key. ``virtualcam_ever_sent`` distinguishes a failure on the very first
+    launch-time attempt (fatal -- exit(1), matching ``_init_mode``'s
+    fail-fast-before-real-work behavior) from a failure after it already
+    worked once, or from a runtime ('v' key) toggle that was never requested
+    at launch (both non-fatal: print + turn the toggle back off, keep the
+    session alive).
     """
     tracker, detectors, scene, interaction = _init_mode(args)
 
     show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
     last_fps: Optional[float] = None
     preview = PreviewSink(WINDOW_NAME)
+
+    virtualcam = VirtualCamSink()
+    virtualcam_active = args.virtualcam
+    virtualcam_ever_sent = False
 
     try:
         with WebcamSource() as webcam:
@@ -224,14 +286,26 @@ def run(args: argparse.Namespace) -> None:
                     is_pinching=bool(gesture_state is not None and gesture_state.is_pinching),
                     hand_present=hand_present,
                 )
-                hud.draw_hud(frame, hud.build_hud_lines(args.mode, last_fps, label, status))
+                hud.draw_hud(
+                    frame,
+                    hud.build_hud_lines(
+                        args.mode, last_fps, label, status, virtualcam_active=virtualcam_active
+                    ),
+                )
 
+                # Both sinks are fed the SAME composited+HUD frame. The HUD is
+                # intentionally visible in the virtual-cam feed for this debug
+                # harness; hiding it there specifically is future polish.
                 preview.send(frame)
+                virtualcam_active, virtualcam_ever_sent = _pump_virtualcam(
+                    virtualcam, frame, virtualcam_active, virtualcam_ever_sent, args.virtualcam
+                )
 
                 key = cv2.waitKey(WAIT_KEY_DELAY_MS) & 0xFF
                 if key == ord(QUIT_KEY):
                     break
                 show_skeleton = _toggle_skeleton(key, show_skeleton)
+                virtualcam_active = _toggle_virtualcam(key, virtualcam_active)
                 if args.mode == MODE_IMAGE:
                     scene, interaction = _handle_image_key(key, scene, interaction)
     except CameraError as exc:
@@ -241,6 +315,7 @@ def run(args: argparse.Namespace) -> None:
         if tracker is not None:
             tracker.close()
         preview.close()
+        virtualcam.close()
 
 
 def main(argv=None) -> None:

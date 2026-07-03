@@ -13,12 +13,13 @@ Two runnable modes, selected at launch:
 
 Mode 2 is a superset of mode 1. Build mode 1 first, fully working, then layer mode 2 on top.
 
-## Out of scope for MVP (do NOT build yet)
-- Virtual camera output (no `pyvirtualcam` yet — we display in an OpenCV window)
-- Window/screen capture
+## Out of scope for MVP Chunk 1 (since lifted by `plan-2.md`)
+Chunk 2 lifts most of the original exclusions: virtual camera output shipped in
+Phase 6 (`--virtualcam` / 'v' key via pyvirtualcam + OBS Virtual Camera);
+window/screen capture and multi-layer manipulation follow in Phases 7-8.
+Still out of scope:
 - iPhone/iPad mirroring
-- Multi-hand or multi-object manipulation (single hand, single image is fine)
-- Any packaging/installer
+- Any packaging/installer (Chunk 3)
 
 ## Tech stack
 - **Python 3.11**
@@ -56,8 +57,9 @@ shacam-win/
     ├── compositor.py       # alpha-composite layers onto the webcam frame in place, by z-order
     ├── interaction.py      # grab/move/resize state machines over the selected layer
     └── sinks/              # frame consumers (Sink contract)
-        ├── base.py         #   Sink ABC
-        └── preview.py      #   PreviewSink: cv2.imshow window
+        ├── base.py         #   Sink ABC + SinkError
+        ├── preview.py      #   PreviewSink: cv2.imshow window
+        └── virtualcam.py   #   VirtualCamSink: pyvirtualcam broadcast (OBS backend)
 ```
 
 ## How to run

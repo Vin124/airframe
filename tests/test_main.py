@@ -15,11 +15,15 @@ from src.main import (
     SCALE_DOWN_KEYS,
     SCALE_UP_KEYS,
     TOGGLE_SKELETON_KEY,
+    TOGGLE_VIRTUALCAM_KEY,
     _handle_image_key,
+    _pump_virtualcam,
     _toggle_skeleton,
+    _toggle_virtualcam,
     parse_args,
 )
 from src.scene import Layer, Scene, Transform
+from src.sinks import SinkError
 from src.sources.base import Size, Source
 
 
@@ -71,6 +75,16 @@ def test_invalid_mode_is_rejected():
         parse_args(["--mode", "bogus"])
 
 
+def test_virtualcam_flag_defaults_false():
+    args = parse_args(["--mode", "skeleton"])
+    assert args.virtualcam is False
+
+
+def test_virtualcam_flag_can_be_enabled():
+    args = parse_args(["--mode", "skeleton", "--virtualcam"])
+    assert args.virtualcam is True
+
+
 # --------------------------------------------------------------------------- #
 # Runtime key handling (pure state transitions, no camera/display needed)
 # --------------------------------------------------------------------------- #
@@ -86,6 +100,19 @@ def test_toggle_skeleton_key_flips_false_to_true():
 def test_toggle_skeleton_other_key_leaves_state_unchanged():
     assert _toggle_skeleton(ord("x"), True) is True
     assert _toggle_skeleton(ord("x"), False) is False
+
+
+def test_toggle_virtualcam_key_flips_true_to_false():
+    assert _toggle_virtualcam(TOGGLE_VIRTUALCAM_KEY, True) is False
+
+
+def test_toggle_virtualcam_key_flips_false_to_true():
+    assert _toggle_virtualcam(TOGGLE_VIRTUALCAM_KEY, False) is True
+
+
+def test_toggle_virtualcam_other_key_leaves_state_unchanged():
+    assert _toggle_virtualcam(ord("x"), True) is True
+    assert _toggle_virtualcam(ord("x"), False) is False
 
 
 def test_handle_image_key_scale_up():
@@ -129,3 +156,56 @@ def test_handle_image_key_reset_also_idles_grab_and_resize():
     # Transform is recentered on the selected layer too.
     t = result_scene.selected_layer.transform
     assert (t.center_x, t.center_y, t.scale) == (0.5, 0.5, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# _pump_virtualcam: fatal vs graceful SinkError handling
+# --------------------------------------------------------------------------- #
+
+class _FakeVirtualCamSink:
+    """Records sends; raises SinkError when told to fail."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.sent = 0
+
+    def send(self, frame) -> None:
+        if self.fail:
+            raise SinkError("backend gone")
+        self.sent += 1
+
+
+def test_pump_virtualcam_inactive_sends_nothing():
+    sink = _FakeVirtualCamSink()
+    active, ever_sent = _pump_virtualcam(sink, "frame", False, False, False)
+    assert (active, ever_sent) == (False, False)
+    assert sink.sent == 0
+
+
+def test_pump_virtualcam_success_marks_ever_sent():
+    sink = _FakeVirtualCamSink()
+    active, ever_sent = _pump_virtualcam(sink, "frame", True, False, True)
+    assert (active, ever_sent) == (True, True)
+    assert sink.sent == 1
+
+
+def test_pump_virtualcam_launch_failure_is_fatal():
+    # --virtualcam requested, never worked -> fail fast like _init_mode does.
+    sink = _FakeVirtualCamSink(fail=True)
+    with pytest.raises(SystemExit) as excinfo:
+        _pump_virtualcam(sink, "frame", True, False, True)
+    assert excinfo.value.code == 1
+
+
+def test_pump_virtualcam_failure_after_success_degrades_gracefully():
+    # Worked once (OBS closed mid-session): warn + toggle off, session lives.
+    sink = _FakeVirtualCamSink(fail=True)
+    active, ever_sent = _pump_virtualcam(sink, "frame", True, True, True)
+    assert (active, ever_sent) == (False, True)
+
+
+def test_pump_virtualcam_runtime_toggle_failure_is_not_fatal():
+    # 'v' toggled at runtime without --virtualcam: never fatal.
+    sink = _FakeVirtualCamSink(fail=True)
+    active, ever_sent = _pump_virtualcam(sink, "frame", True, False, False)
+    assert (active, ever_sent) == (False, False)

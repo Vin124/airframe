@@ -2,13 +2,22 @@
 
 A sink is the output end of the pipeline: hand it a finished BGR frame via
 ``send()`` each tick. Keeping this one-method contract means the loop can drive
-a preview window today and additionally a virtual camera later (Phase 6) from
-the same composited frame, with no branching in the loop.
+a preview window today and additionally a virtual camera (Phase 6) from the
+same composited frame, with no branching in the loop.
 """
 
 from abc import ABC, abstractmethod
 
 import numpy as np
+
+
+class SinkError(RuntimeError):
+    """Raised when a sink can't be initialized or written to.
+
+    Kept generic (mirrors ``sources.base.SourceError``) so callers can catch
+    one error type regardless of which sink raised it -- e.g. a missing
+    virtual-camera backend surfaces as this, with an actionable message.
+    """
 
 
 class Sink(ABC):
