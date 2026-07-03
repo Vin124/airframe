@@ -14,3 +14,13 @@ windows-capture
 # useful-moonshine-onnx: preferred ASR engine (model 'moonshine/base') -- use
 #   the PyPI wheel; the git-subdirectory install from the moonshine repo README
 #   no longer builds since the repo was restructured.
+
+# --- Optional: LLM parser (Phase 13, run with --speech --parse). No extra pip
+# package is needed -- src/parser.py's OllamaClient speaks Ollama's HTTP API
+# with the stdlib `urllib.request`. You do need the Ollama app itself running
+# locally with a small model pulled:
+#   1. install Ollama: https://ollama.com
+#   2. ollama pull qwen2.5:1.5b   (or another small 1-3B instruction model)
+#   3. `ollama serve` (or let the Ollama app run it) so localhost:11434 answers
+# Without a reachable server the parser degrades to one stderr notice per
+# phrase and the app keeps running with --speech's transcript-only output.

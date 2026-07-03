@@ -71,6 +71,9 @@ _DEFAULTS: Dict[str, Any] = {
     # Speech layer opt-in (Phase 12, --speech). Like virtualcam: a store_true CLI
     # flag whose last state is remembered here.
     "speech": False,
+    # LLM parser opt-in (Phase 13, --parse; only meaningful with --speech). Same
+    # store_true-flag-remembered-here shape as speech/virtualcam.
+    "parse": False,
     # Live pinch tuning (panel sliders); clamped as a pair so exit > enter.
     "pinch_enter": DEFAULT_PINCH_ENTER,
     "pinch_exit": DEFAULT_PINCH_EXIT,
@@ -131,6 +134,10 @@ def merge_config(loaded: Any) -> Dict[str, Any]:
     speech = loaded.get("speech")
     if isinstance(speech, bool):
         config["speech"] = speech
+
+    parse = loaded.get("parse")
+    if isinstance(parse, bool):
+        config["parse"] = parse
 
     # Pinch tuning: accept each value only if it's a number inside the slider
     # range (else fall back to that key's default), then run the PAIR through the

@@ -33,6 +33,7 @@ from src.tuning import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
     from src.main import PipelineRuntime
     from src.panel import ControlPanel
+    from src.speech import PhraseCallback
 
 
 def resolve_panel_prefill(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -62,6 +63,9 @@ def resolve_panel_prefill(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict
         # Speech opt-in: store_true CLI can only force ON, else remembered config
         # value (same precedence rule as --virtualcam).
         "speech": bool(args.speech or cfg.get("speech", False)),
+        # Parser opt-in (Phase 13): same store_true precedence as --speech. Only
+        # acted on when speech is also on (see build_speech_on_phrase).
+        "parse": bool(args.parse or cfg.get("parse", False)),
         # Pinch tuning has no CLI flag (it's the live sliders): config > default.
         # cfg already validated/clamped these through merge_config.
         "pinch_enter": cfg.get("pinch_enter", DEFAULT_PINCH_ENTER),
@@ -128,6 +132,7 @@ def _final_settings(
     tuning: GestureTuning,
     confidence: TrackerConfidence,
     speech: bool = False,
+    parse: bool = False,
 ) -> Dict[str, Any]:
     """The settings dict persisted on exit.
 
@@ -136,18 +141,54 @@ def _final_settings(
     window is closed, so a 'v' hotkey flip after that would otherwise persist
     stale. Falls back to args-derived settings when no panel was built. The pinch
     ``tuning`` (runtime-authoritative, driven by the sliders), the startup
-    ``confidence`` (never changes at runtime), and the resolved ``speech`` opt-in
-    are overlaid last so all round-trip -- the panel has no widget for any of them.
+    ``confidence`` (never changes at runtime), and the resolved ``speech`` /
+    ``parse`` opt-ins are overlaid last so all round-trip -- the panel has no
+    widget for any of them.
     """
     settings = _config_from_args(args, vcam_state) if panel is None else panel.current_settings()
     settings["virtualcam"] = bool(vcam_state)
     settings["speech"] = bool(speech)
+    settings["parse"] = bool(parse)
     settings["pinch_enter"] = tuning.enter
     settings["pinch_exit"] = tuning.exit
     settings["min_detection_confidence"] = confidence.detection
     settings["min_presence_confidence"] = confidence.presence
     settings["min_tracking_confidence"] = confidence.tracking
     return settings
+
+
+def build_speech_on_phrase(parse_enabled: bool) -> Optional["PhraseCallback"]:
+    """Compose the speech ``on_phrase`` callback (the Phase 13 wiring seam).
+
+    Returns ``None`` when parsing is off, so ``speech_session`` keeps its default
+    callback (which prints the live ``[speech]`` transcript). When on, returns a
+    callback that BOTH prints that live transcript AND runs the LLM parser,
+    logging ``[parser] {...}`` for actionable phrases only (non-actionable /
+    failed parses return ``None`` and are ignored).
+
+    THREADING: this callback runs on the SPEECH thread (``SpeechWorker`` invokes
+    ``on_phrase`` there, never the render loop). The ``RequestParser.parse`` LLM
+    call BLOCKS for a few hundred ms, which is fine off the render thread; its
+    bounded HTTP timeout plus the worker's bounded ``stop()`` join ensure a slow
+    or failed call can never wedge app shutdown. Kept in the launch layer so the
+    parser is composed once here rather than threaded through many layers. The
+    parser + speech imports are deferred so a headless import of this module (and
+    its unit tests) doesn't pull them in.
+    """
+    if not parse_enabled:
+        return None
+    from src.parser import build_request_parser
+    from src.speech import default_on_phrase
+
+    parser = build_request_parser()
+
+    def on_phrase(text: str) -> None:
+        default_on_phrase(text)  # preserve the Phase 12 live-transcript line
+        request = parser.parse(text)
+        if request is not None and request.is_actionable:
+            print(f"[parser] {request}")
+
+    return on_phrase
 
 
 def _build_panel(runtime: "PipelineRuntime", prefill: Dict[str, Any]) -> Optional["ControlPanel"]:
@@ -220,6 +261,17 @@ def parse_args(argv=None) -> argparse.Namespace:
             "background thread and print a live transcript to the console "
             "(Moonshine, falling back to faster-whisper). Off by default; the "
             "last state is remembered in the config."
+        ),
+    )
+    parser.add_argument(
+        "--parse",
+        action="store_true",
+        help=(
+            "Enable the Phase 13 LLM parser: turn each finalized speech phrase "
+            "into a structured request (action/query/route/source) via a local "
+            "Ollama model and print it to the console. Only meaningful with "
+            "--speech; needs Ollama running + a small model pulled (qwen2.5:1.5b). "
+            "Off by default; the last state is remembered in the config."
         ),
     )
     parser.add_argument(

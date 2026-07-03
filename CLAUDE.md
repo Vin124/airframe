@@ -15,6 +15,7 @@ python -m src.main --mode skeleton --gpu      # request GPU delegate (falls back
 python -m src.main --mode image --image assets/test.png --no-panel  # hotkeys only, no control panel
 python -m src.main --mode skeleton --min-detection-confidence 0.7 --min-tracking-confidence 0.6  # startup-only MediaPipe confidences
 python -m src.main --mode skeleton --speech    # + always-listening mic transcription printed to console (Phase 12)
+python -m src.main --mode skeleton --speech --parse   # + local-LLM parse of each finalized phrase into a structured request (Phase 13, needs Ollama running)
 ```
 A small **Tkinter control panel** opens alongside the preview by default (Phase
 10): pick a source (image file picker / editable window-title dropdown / monitor
@@ -29,8 +30,10 @@ and pre-fill on start; precedence is **CLI > config > defaults**.
 
 Persisted config keys: `source`, `image_path`, `window_title`, `monitor_index`,
 `virtualcam`, `speech` (Phase 12 opt-in, `--speech` store_true, remembered like
-`virtualcam`), `pinch_enter` / `pinch_exit` (live slider thresholds), and
-`min_detection_confidence` / `min_presence_confidence` / `min_tracking_confidence`
+`virtualcam`), `parse` (Phase 13 opt-in, `--parse` store_true, remembered the
+same way; only meaningful when `speech` is also on), `pinch_enter` /
+`pinch_exit` (live slider thresholds), and `min_detection_confidence` /
+`min_presence_confidence` / `min_tracking_confidence`
 (startup-only MediaPipe knobs, also `--min-*-confidence` flags).
 
 Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
@@ -56,6 +59,7 @@ src/camera.py         # low-level webcam open/read/release
 src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; --gpu delegate + CPU fallback
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
 src/speech.py         # SpeechWorker: mic capture + energy-VAD phrase segmentation + ASR (Moonshine -> faster-whisper fallback) on its own thread (Phase 12); pure VAD + rolling-transcript helpers; deferred deps; speech_session() launch glue
+src/parser.py          # RequestParser: one finalized phrase -> a strict-JSON structured ParsedRequest via a local Ollama model (Phase 13); pure prompt-build + JSON-extract + enum-normalize helpers are the security boundary; OllamaClient speaks Ollama's HTTP API over stdlib urllib (no new dep); wired as (part of) the speech thread's on_phrase callback, see src/launch.py's build_speech_on_phrase
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
 src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
@@ -147,6 +151,25 @@ hand-off, GIL-safe, latest-frame-wins):
   at the top of `src/speech.py` (`VAD_RMS_THRESHOLD`, `SILENCE_GAP_SECONDS`,
   `MAX_PHRASE_SECONDS`, `ROLLING_TRANSCRIPT_SIZE`); only finalized phrases are
   transcribed (no streaming) to keep CPU/latency low.
+- LLM parser (Phase 13, `--parse`, `src/parser.py`): only meaningful together
+  with `--speech` (`src.launch.build_speech_on_phrase` wires it into
+  `SpeechWorker`'s `on_phrase`, so it runs ON THE SPEECH THREAD, same
+  cheap/thread-safe rule as the transcript print). `RequestParser.parse` never
+  raises: an `OllamaClient` HTTP failure (server down, model not pulled) or any
+  malformed/non-JSON model reply prints one stderr notice and returns `None`
+  for that phrase, degrading to Phase 12's transcript-only line — Ollama being
+  unreachable can't crash the app. Model output is NEVER trusted directly:
+  `parse_llm_json` extracts the first balanced `{...}` block (tolerating stray
+  prose/markdown fences smaller models add despite the "JSON only" prompt) and
+  `normalize_route` / `normalize_source` clamp every field to a fixed enum
+  (unknown route -> `retrieve`, unknown source -> `wikimedia`, `generate`
+  routes always force `source="generator"`) — this is the ONE validation
+  boundary Phase 14/16 can rely on downstream. A non-`insert` action or a blank
+  query both parse to `None` (ignored), matching "ignore non-actionable
+  speech." No new pip dependency: `OllamaClient` speaks Ollama's REST API
+  (`/api/generate`, `format="json"`, temperature 0) via stdlib `urllib.request`
+  — only the separate Ollama application + a pulled small model are required
+  at runtime (see `requirements.txt`).
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
   confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it

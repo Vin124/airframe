@@ -9,15 +9,13 @@ Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
 21-point skeleton and a pinch/grab gesture debug label on the mirrored feed.
 Image mode starts with one overlay ``Layer`` you can pinch-grab/move, scale with
 +/- keys, and two-hand-pinch to resize (see ``src.interaction``). Its source is
-chosen by ``--source``: a static image (default), a live app ``window`` captured
-by title, or a monitor ``screen`` (Windows Graphics Capture). At runtime you can
-add more layers ('a'/'w'/'m' for image/window/screen), remove the selected layer
-('x'), and bring it to the front ('f'); a pinch grabs the top-most layer under
-the pinch point, and the selected layer is outlined. Both modes mirror the feed
-(in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a small HUD
-(mode/FPS/gesture/key legend), and quit on 'q'. Optionally (``--virtualcam`` or
-the 'v' key) the same composited+HUD frame is also broadcast to a virtual webcam
-via ``VirtualCamSink`` so it can be selected as a camera in Zoom/Teams/Meet.
+chosen by ``--source``: a static image (default), a live app ``window`` by title,
+or a monitor ``screen`` (Windows Graphics Capture). At runtime you can add more
+layers ('a'/'w'/'m'), remove the selected one ('x'), and bring it to front ('f');
+a pinch grabs the top-most layer under the pinch point, which is outlined. Both
+modes mirror the feed, show it via ``PreviewSink``, print FPS, draw a small HUD,
+and quit on 'q'. Optionally (``--virtualcam`` / 'v' key) the composited+HUD frame
+is also broadcast to a virtual webcam so it can be picked in Zoom/Teams/Meet.
 
 The scene/source-layer transitions live in ``src.layers`` and the launch-time
 settings glue (panel prefill, config <-> args, panel build) in ``src.launch``;
@@ -113,6 +111,7 @@ from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     _build_panel,
     _config_from_args,
     _final_settings,
+    build_speech_on_phrase,
     confidence_from_prefill,
     parse_args,
     resolve_panel_prefill,
@@ -745,17 +744,18 @@ def run(args: argparse.Namespace) -> None:
         if not args.no_panel:
             panel = _build_panel(runtime, prefill)
             runtime.set_panel(panel)
-        # Speech (Phase 12) runs on its OWN thread, stopped cleanly on block exit.
-        with speech_session(prefill["speech"]):
+        # Speech (Phase 12) runs on its OWN thread. Phase 13: when --parse is on,
+        # its finalized-phrase callback runs the LLM parser ON THE SPEECH THREAD
+        # (never the render loop); None = default [speech]-only transcript.
+        with speech_session(prefill["speech"], on_phrase=build_speech_on_phrase(prefill["parse"])):
             runtime.run()
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
         # stop() reports whether the tracking thread really exited; if a native
-        # detect() wedged past the join timeout, freeing the tracker under the
-        # still-running thread risks a native use-after-free, so skip close()
-        # and let process exit reclaim it (same policy as ThreadedSource.close).
+        # detect() wedged past the join timeout, freeing the tracker under it
+        # risks a use-after-free, so skip close() and let process exit reclaim it.
         worker_stopped = worker.stop() if worker is not None else True
         webcam.close()
         if tracker is not None:
@@ -764,28 +764,27 @@ def run(args: argparse.Namespace) -> None:
             else:
                 print(
                     "Warning: tracking thread didn't stop in time; leaving the "
-                    "hand tracker to be reclaimed at process exit.",
-                    file=sys.stderr,
+                    "hand tracker to be reclaimed at process exit.", file=sys.stderr,
                 )
         preview.close()
         virtualcam.close()
-        # Persist last-used settings (source/path/title/monitor + vcam). Prefer
-        # the panel's live field values; fall back to the launch args when the
-        # panel was off (--no-panel) or never built. save_config never raises.
+        # Persist last-used settings: prefer the panel's/runtime's live values
+        # (sliders drove the tuning), fall back to launch args when the panel was
+        # off or never built. save_config never raises.
         vcam_state = runtime.virtualcam_active if runtime is not None else args.virtualcam
-        # Persist the runtime-authoritative pinch tuning (the sliders drove it)
-        # and the startup-only confidences so both round-trip next launch.
         tuning_state = runtime.tuning if runtime is not None else tuning
         config.save_config(
             config.CONFIG_FILENAME,
-            _final_settings(panel, args, vcam_state, tuning_state, confidence, prefill["speech"]),
+            _final_settings(
+                panel, args, vcam_state, tuning_state, confidence,
+                prefill["speech"], prefill["parse"],
+            ),
         )
         if panel is not None:
             panel.close()
-        # Release any layer sources (stops live window/screen capture threads; a
-        # no-op for image layers). Use the runtime's final scene so layers added
-        # at runtime are also closed; fall back to the initial scene if the
-        # runtime never got built. Empty in skeleton mode.
+        # Release any layer sources (stops live window/screen capture threads;
+        # no-op for image layers). Use the runtime's final scene so runtime-added
+        # layers close too; fall back to the initial scene if run never started.
         final_scene = runtime.scene if runtime is not None else scene
         for layer in final_scene.layers:
             layer.source.close()

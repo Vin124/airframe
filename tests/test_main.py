@@ -149,6 +149,94 @@ def test_final_settings_persists_speech():
 
 
 # --------------------------------------------------------------------------- #
+# --parse flag (Phase 13): parsing + config/prefill resolution + persistence
+# --------------------------------------------------------------------------- #
+
+def test_parse_flag_defaults_false():
+    assert parse_args(["--mode", "skeleton"]).parse is False
+
+
+def test_parse_flag_can_be_enabled():
+    assert parse_args(["--mode", "skeleton", "--parse"]).parse is True
+
+
+def test_resolve_prefill_parse_cli_forces_on():
+    args = parse_args(["--mode", "skeleton", "--parse"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["parse"] is True
+
+
+def test_resolve_prefill_parse_from_config_when_cli_off():
+    args = parse_args(["--mode", "skeleton"])  # no --parse
+    pf = resolve_panel_prefill(args, {"parse": True})
+    assert pf["parse"] is True  # remembered config value carries
+
+
+def test_resolve_prefill_parse_defaults_off():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["parse"] is False
+
+
+def test_final_settings_persists_parse():
+    args = parse_args(["--mode", "skeleton"])
+    on = _final_settings(None, args, False, _TUNING, _CONFIDENCE, speech=True, parse=True)
+    off = _final_settings(None, args, False, _TUNING, _CONFIDENCE, speech=True, parse=False)
+    assert on["parse"] is True
+    assert off["parse"] is False
+
+
+def test_build_speech_on_phrase_none_when_parse_off():
+    from src.launch import build_speech_on_phrase
+
+    assert build_speech_on_phrase(False) is None
+
+
+def test_build_speech_on_phrase_prints_transcript_and_degrades_without_a_parse(
+    monkeypatch, capsys
+):
+    # No real Ollama server/network in this suite (same rule as test_parser.py):
+    # fake out build_request_parser so this stays pure/fast. A non-actionable
+    # (or failed) parse must still leave the Phase 12 transcript line intact.
+    import src.parser as parser_module
+    from src.launch import build_speech_on_phrase
+
+    class _NonActionableParser:
+        def parse(self, text):
+            return None
+
+    monkeypatch.setattr(parser_module, "build_request_parser", lambda: _NonActionableParser())
+
+    on_phrase = build_speech_on_phrase(True)
+    assert callable(on_phrase)
+    on_phrase("how was your weekend")
+    captured = capsys.readouterr()
+    assert "[speech] how was your weekend" in captured.out
+    assert "[parser]" not in captured.out
+
+
+def test_build_speech_on_phrase_logs_actionable_parse(monkeypatch, capsys):
+    import src.parser as parser_module
+    from src.launch import build_speech_on_phrase
+    from src.parser import ParsedRequest
+
+    class _ActionableParser:
+        def parse(self, text):
+            return ParsedRequest("insert", "CFTR protein structure", "retrieve", "wikimedia")
+
+    monkeypatch.setattr(parser_module, "build_request_parser", lambda: _ActionableParser())
+
+    on_phrase = build_speech_on_phrase(True)
+    on_phrase("yeah we're looking at CFTR")
+    captured = capsys.readouterr()
+    assert "[speech] yeah we're looking at CFTR" in captured.out
+    assert (
+        '[parser] {action: insert, query: "CFTR protein structure", '
+        "route: retrieve, source: wikimedia}" in captured.out
+    )
+
+
+# --------------------------------------------------------------------------- #
 # --gpu flag (Phase 9): parsing + plumbing into the tracker
 # --------------------------------------------------------------------------- #
 
