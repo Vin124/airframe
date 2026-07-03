@@ -53,7 +53,9 @@ shacam-win/
 ├── assets/
 │   └── test.png            # any test image for image mode
 └── src/
-    ├── main.py             # entry point, arg parsing, mode dispatch, PipelineRuntime (main loop), thread wiring
+    ├── main.py             # entry point, arg parsing, mode dispatch, PipelineRuntime (main loop), thread wiring; re-exports layers/launch helpers for the test surface
+    ├── layers.py           # scene/source-layer transitions (build/add/remove/fit) + mode/source/layer-key vocabulary; camera-free + unit-testable
+    ├── launch.py           # launch-time settings glue: panel prefill, config <-> args, panel build (lazy Tk import)
     ├── camera.py           # low-level webcam open/read/release wrapper
     ├── hand_tracker.py     # MediaPipe wrapper -> normalized 21-landmark list; --gpu delegate + CPU fallback
     ├── tracking.py         # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
@@ -101,7 +103,8 @@ reference assignment (latest-frame-wins, GIL-safe, no locks):
   The HUD shows per-stage timings (capture age, track, composite, sink, loop).
 
 `PipelineRuntime` lives in `main.py` (rather than its own module) so it can share
-the already-unit-tested loop helpers without a circular import; `run()` is a thin
+the already-unit-tested loop helpers in `layers.py` without a circular import
+(`main` imports `layers`/`launch`, never the reverse); `run()` is a thin
 setup/teardown shell around it.
 
 ## How to run

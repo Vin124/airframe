@@ -44,9 +44,6 @@ KEY_LEGEND_LINES = (
     "q quit | s skel | r reset | +/- scale",
     "v vcam | a/w/m add | f front | x remove",
 )
-# Backward-compatible single-string view (joined), kept for callers/tests that
-# treat the legend as one blob of text.
-KEY_LEGEND = " | ".join(KEY_LEGEND_LINES)
 
 _NO_FPS_TEXT = "--"
 

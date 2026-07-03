@@ -8,6 +8,7 @@ webcam/display access happens until run() is called).
 import numpy as np
 import pytest
 
+import src.layers
 import src.main
 from src import config
 from src.interaction import GrabState, InteractionState, ResizeState
@@ -415,7 +416,7 @@ def test_build_layer_source_window_dispatch(monkeypatch):
             created["opened"] = True
             return self
 
-    monkeypatch.setattr(src.main, "WindowSource", _FakeWindowSource)
+    monkeypatch.setattr(src.layers, "WindowSource", _FakeWindowSource)
     args = parse_args(["--mode", "image", "--source", "window", "--window-title", "Pad"])
     source = _build_layer_source(args)
     assert isinstance(source, _FakeWindowSource)
@@ -433,7 +434,7 @@ def test_build_layer_source_screen_dispatch(monkeypatch):
             created["opened"] = True
             return self
 
-    monkeypatch.setattr(src.main, "MonitorSource", _FakeMonitorSource)
+    monkeypatch.setattr(src.layers, "MonitorSource", _FakeMonitorSource)
     args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "2"])
     source = _build_layer_source(args)
     assert isinstance(source, _FakeMonitorSource)
@@ -533,7 +534,7 @@ def test_handle_layer_keys_add_image_without_path_is_noop(capsys):
 
 
 def test_handle_layer_keys_add_window_marks_live_fit(monkeypatch):
-    monkeypatch.setattr(src.main, "WindowSource", _FakeLiveSource)
+    monkeypatch.setattr(src.layers, "WindowSource", _FakeLiveSource)
     args = parse_args(["--mode", "image", "--source", "window", "--window-title", "Pad"])
     scene = _scene()
     new_scene, _interaction, fit_ids = _handle_layer_keys(
@@ -564,7 +565,7 @@ def test_handle_layer_keys_add_window_failure_keeps_running(monkeypatch, capsys)
         def open(self):
             raise SourceError("Could not capture a window matching title 'X'.")
 
-    monkeypatch.setattr(src.main, "WindowSource", _FailingWindowSource)
+    monkeypatch.setattr(src.layers, "WindowSource", _FailingWindowSource)
     args = parse_args(["--mode", "image", "--source", "window", "--window-title", "X"])
     scene = _scene()
     new_scene, _interaction, fit_ids = _handle_layer_keys(
@@ -575,7 +576,7 @@ def test_handle_layer_keys_add_window_failure_keeps_running(monkeypatch, capsys)
 
 
 def test_handle_layer_keys_add_screen_dispatch(monkeypatch):
-    monkeypatch.setattr(src.main, "MonitorSource", _FakeLiveSource)
+    monkeypatch.setattr(src.layers, "MonitorSource", _FakeLiveSource)
     args = parse_args(["--mode", "image", "--source", "screen", "--monitor-index", "2"])
     scene = _scene()
     new_scene, _interaction, fit_ids = _handle_layer_keys(
@@ -841,7 +842,7 @@ def test_runtime_add_image_layer_bad_path_surfaces_status_not_crash(capsys):
 
 
 def test_runtime_add_window_layer_success_marks_fit(monkeypatch):
-    monkeypatch.setattr(src.main, "WindowSource", _FakeLiveSource)
+    monkeypatch.setattr(src.layers, "WindowSource", _FakeLiveSource)
     rt = _image_runtime(scene=_scene())
     rt.add_window_layer("Pad")
     added = rt.scene.selected_layer
@@ -859,7 +860,7 @@ def test_runtime_add_window_layer_source_error_surfaces_status(monkeypatch, caps
         def open(self):
             raise SourceError("Could not capture a window matching title 'X'.")
 
-    monkeypatch.setattr(src.main, "WindowSource", _FailingWindowSource)
+    monkeypatch.setattr(src.layers, "WindowSource", _FailingWindowSource)
     rt = _image_runtime(scene=_scene())
     before = rt.scene
     rt.add_window_layer("X")
@@ -869,7 +870,7 @@ def test_runtime_add_window_layer_source_error_surfaces_status(monkeypatch, caps
 
 
 def test_runtime_add_screen_layer_uses_index(monkeypatch):
-    monkeypatch.setattr(src.main, "MonitorSource", _FakeLiveSource)
+    monkeypatch.setattr(src.layers, "MonitorSource", _FakeLiveSource)
     rt = _image_runtime(scene=_scene())
     rt.add_screen_layer(2)
     added = rt.scene.selected_layer

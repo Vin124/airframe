@@ -32,9 +32,11 @@ the selected layer is outlined.
 Pipeline: webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**.
 As of Phase 9 the stages are decoupled across threads (see Threading model below).
 ```
-src/main.py           # entry: argparse, mode dispatch, PipelineRuntime (main loop), thread wiring
+src/main.py           # entry: argparse, mode dispatch, PipelineRuntime (main loop), thread wiring; re-exports the moved helpers/constants (layers, launch) for the test surface
+src/layers.py         # scene/source-layer transitions (build/add/remove/fit) + the mode/source/layer-key vocabulary; camera-free + unit-testable
+src/launch.py         # launch-time settings glue: panel prefill, config <-> args, panel build (lazy Tk import)
 src/runtime note      #   PipelineRuntime lives in main.py (kept there to avoid a circular import
-                      #   with the tested loop helpers); run() is a thin setup/teardown shell
+                      #   with the tested loop helpers in layers.py); run() is a thin setup/teardown shell
 src/camera.py         # low-level webcam open/read/release
 src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; --gpu delegate + CPU fallback
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
