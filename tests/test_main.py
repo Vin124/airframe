@@ -111,6 +111,44 @@ def test_virtualcam_flag_can_be_enabled():
 
 
 # --------------------------------------------------------------------------- #
+# --speech flag (Phase 12): parsing + config/prefill resolution + persistence
+# --------------------------------------------------------------------------- #
+
+def test_speech_flag_defaults_false():
+    assert parse_args(["--mode", "skeleton"]).speech is False
+
+
+def test_speech_flag_can_be_enabled():
+    assert parse_args(["--mode", "skeleton", "--speech"]).speech is True
+
+
+def test_resolve_prefill_speech_cli_forces_on():
+    args = parse_args(["--mode", "skeleton", "--speech"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["speech"] is True
+
+
+def test_resolve_prefill_speech_from_config_when_cli_off():
+    args = parse_args(["--mode", "skeleton"])  # no --speech
+    pf = resolve_panel_prefill(args, {"speech": True})
+    assert pf["speech"] is True  # remembered config value carries
+
+
+def test_resolve_prefill_speech_defaults_off():
+    args = parse_args(["--mode", "skeleton"])
+    pf = resolve_panel_prefill(args, config.default_config())
+    assert pf["speech"] is False
+
+
+def test_final_settings_persists_speech():
+    args = parse_args(["--mode", "skeleton"])
+    on = _final_settings(None, args, False, _TUNING, _CONFIDENCE, speech=True)
+    off = _final_settings(None, args, False, _TUNING, _CONFIDENCE, speech=False)
+    assert on["speech"] is True
+    assert off["speech"] is False
+
+
+# --------------------------------------------------------------------------- #
 # --gpu flag (Phase 9): parsing + plumbing into the tracker
 # --------------------------------------------------------------------------- #
 

@@ -18,6 +18,7 @@ def test_default_config_has_expected_keys_and_values():
         "window_title": "",
         "monitor_index": 1,
         "virtualcam": False,
+        "speech": False,
         "pinch_enter": 0.05,
         "pinch_exit": 0.07,
         "min_detection_confidence": 0.5,
@@ -40,6 +41,7 @@ def test_merge_overlays_loaded_values_over_defaults():
             "window_title": "Notepad",
             "monitor_index": 2,
             "virtualcam": True,
+            "speech": True,
             "pinch_enter": 0.04,
             "pinch_exit": 0.09,
             "min_detection_confidence": 0.6,
@@ -53,6 +55,7 @@ def test_merge_overlays_loaded_values_over_defaults():
         "window_title": "Notepad",
         "monitor_index": 2,
         "virtualcam": True,
+        "speech": True,
         "pinch_enter": 0.04,
         "pinch_exit": 0.09,
         "min_detection_confidence": 0.6,
@@ -73,11 +76,16 @@ def test_merge_rejects_invalid_source():
 
 def test_merge_rejects_wrong_types():
     merged = config.merge_config(
-        {"image_path": 5, "window_title": None, "virtualcam": "yes"}
+        {"image_path": 5, "window_title": None, "virtualcam": "yes", "speech": "on"}
     )
     assert merged["image_path"] == ""
     assert merged["window_title"] == ""
     assert merged["virtualcam"] is False
+    assert merged["speech"] is False  # non-bool speech falls back to default
+
+
+def test_merge_accepts_speech_bool():
+    assert config.merge_config({"speech": True})["speech"] is True
 
 
 def test_merge_rejects_bool_and_out_of_range_monitor_index():
@@ -111,6 +119,7 @@ def test_save_then_load_roundtrips(tmp_path):
         "window_title": "Term",
         "monitor_index": 2,
         "virtualcam": True,
+        "speech": True,
         "pinch_enter": 0.04,
         "pinch_exit": 0.09,
         "min_detection_confidence": 0.6,

@@ -59,6 +59,9 @@ def resolve_panel_prefill(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict
         "window_title": args.window_title or cfg.get("window_title", ""),
         "monitor_index": monitor_index,
         "virtualcam": bool(args.virtualcam or cfg.get("virtualcam", False)),
+        # Speech opt-in: store_true CLI can only force ON, else remembered config
+        # value (same precedence rule as --virtualcam).
+        "speech": bool(args.speech or cfg.get("speech", False)),
         # Pinch tuning has no CLI flag (it's the live sliders): config > default.
         # cfg already validated/clamped these through merge_config.
         "pinch_enter": cfg.get("pinch_enter", DEFAULT_PINCH_ENTER),
@@ -124,6 +127,7 @@ def _final_settings(
     vcam_state: bool,
     tuning: GestureTuning,
     confidence: TrackerConfidence,
+    speech: bool = False,
 ) -> Dict[str, Any]:
     """The settings dict persisted on exit.
 
@@ -131,12 +135,13 @@ def _final_settings(
     (``vcam_state``) is authoritative: the panel's checkbox freezes once its
     window is closed, so a 'v' hotkey flip after that would otherwise persist
     stale. Falls back to args-derived settings when no panel was built. The pinch
-    ``tuning`` (runtime-authoritative, driven by the sliders) and the startup
-    ``confidence`` (never changes at runtime) are overlaid last so both round-trip
-    -- the panel has no widget for the confidence knobs.
+    ``tuning`` (runtime-authoritative, driven by the sliders), the startup
+    ``confidence`` (never changes at runtime), and the resolved ``speech`` opt-in
+    are overlaid last so all round-trip -- the panel has no widget for any of them.
     """
     settings = _config_from_args(args, vcam_state) if panel is None else panel.current_settings()
     settings["virtualcam"] = bool(vcam_state)
+    settings["speech"] = bool(speech)
     settings["pinch_enter"] = tuning.enter
     settings["pinch_exit"] = tuning.exit
     settings["min_detection_confidence"] = confidence.detection
@@ -205,6 +210,16 @@ def parse_args(argv=None) -> argparse.Namespace:
             "Also broadcast the composited frame to a virtual webcam (OBS "
             "Virtual Camera backend required) so it can be selected as a "
             "camera in Zoom/Teams/Meet."
+        ),
+    )
+    parser.add_argument(
+        "--speech",
+        action="store_true",
+        help=(
+            "Enable the always-listening speech layer: capture mic audio on a "
+            "background thread and print a live transcript to the console "
+            "(Moonshine, falling back to faster-whisper). Off by default; the "
+            "last state is remembered in the config."
         ),
     )
     parser.add_argument(

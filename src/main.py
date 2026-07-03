@@ -49,6 +49,7 @@ from src.interaction import InteractionState, step
 from src.scene import Layer, Scene, Transform
 from src.sinks import PreviewSink, SinkError, VirtualCamSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
+from src.speech import speech_session
 from src.sources import (
     ArraySource,
     Source,
@@ -744,7 +745,9 @@ def run(args: argparse.Namespace) -> None:
         if not args.no_panel:
             panel = _build_panel(runtime, prefill)
             runtime.set_panel(panel)
-        runtime.run()
+        # Speech (Phase 12) runs on its OWN thread, stopped cleanly on block exit.
+        with speech_session(prefill["speech"]):
+            runtime.run()
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -775,7 +778,7 @@ def run(args: argparse.Namespace) -> None:
         tuning_state = runtime.tuning if runtime is not None else tuning
         config.save_config(
             config.CONFIG_FILENAME,
-            _final_settings(panel, args, vcam_state, tuning_state, confidence),
+            _final_settings(panel, args, vcam_state, tuning_state, confidence, prefill["speech"]),
         )
         if panel is not None:
             panel.close()

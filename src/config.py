@@ -68,6 +68,9 @@ _DEFAULTS: Dict[str, Any] = {
     "window_title": "",
     "monitor_index": _DEFAULT_MONITOR_INDEX,
     "virtualcam": False,
+    # Speech layer opt-in (Phase 12, --speech). Like virtualcam: a store_true CLI
+    # flag whose last state is remembered here.
+    "speech": False,
     # Live pinch tuning (panel sliders); clamped as a pair so exit > enter.
     "pinch_enter": DEFAULT_PINCH_ENTER,
     "pinch_exit": DEFAULT_PINCH_EXIT,
@@ -124,6 +127,10 @@ def merge_config(loaded: Any) -> Dict[str, Any]:
     virtualcam = loaded.get("virtualcam")
     if isinstance(virtualcam, bool):
         config["virtualcam"] = virtualcam
+
+    speech = loaded.get("speech")
+    if isinstance(speech, bool):
+        config["speech"] = speech
 
     # Pinch tuning: accept each value only if it's a number inside the slider
     # range (else fall back to that key's default), then run the PAIR through the

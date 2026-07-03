@@ -14,6 +14,7 @@ python -m src.main --mode image --source screen --monitor-index 1         # grab
 python -m src.main --mode skeleton --gpu      # request GPU delegate (falls back to CPU on Windows)
 python -m src.main --mode image --image assets/test.png --no-panel  # hotkeys only, no control panel
 python -m src.main --mode skeleton --min-detection-confidence 0.7 --min-tracking-confidence 0.6  # startup-only MediaPipe confidences
+python -m src.main --mode skeleton --speech    # + always-listening mic transcription printed to console (Phase 12)
 ```
 A small **Tkinter control panel** opens alongside the preview by default (Phase
 10): pick a source (image file picker / editable window-title dropdown / monitor
@@ -27,7 +28,8 @@ panel settings persist to `handy_config.json` (repo root, git-ignored) on exit
 and pre-fill on start; precedence is **CLI > config > defaults**.
 
 Persisted config keys: `source`, `image_path`, `window_title`, `monitor_index`,
-`virtualcam`, `pinch_enter` / `pinch_exit` (live slider thresholds), and
+`virtualcam`, `speech` (Phase 12 opt-in, `--speech` store_true, remembered like
+`virtualcam`), `pinch_enter` / `pinch_exit` (live slider thresholds), and
 `min_detection_confidence` / `min_presence_confidence` / `min_tracking_confidence`
 (startup-only MediaPipe knobs, also `--min-*-confidence` flags).
 
@@ -53,6 +55,7 @@ src/runtime note      #   PipelineRuntime lives in main.py (kept there to avoid 
 src/camera.py         # low-level webcam open/read/release
 src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; --gpu delegate + CPU fallback
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
+src/speech.py         # SpeechWorker: mic capture + energy-VAD phrase segmentation + ASR (Moonshine -> faster-whisper fallback) on its own thread (Phase 12); pure VAD + rolling-transcript helpers; deferred deps; speech_session() launch glue
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
 src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
@@ -79,8 +82,9 @@ src/sinks/            # frame consumers (Sink contract)
 ```
 
 ## Threading model (Phase 9)
-Three threads, each a single owner of its state (no locks — one atomic reference
-publish per hand-off, GIL-safe, latest-frame-wins):
+Three threads (a fourth, the speech thread, is added optionally in Phase 12),
+each a single owner of its state (no locks — one atomic reference publish per
+hand-off, GIL-safe, latest-frame-wins):
 - **Capture thread** (`ThreadedSource` around `WebcamSource`): does the blocking
   `cv2` read and publishes each frame as an `(seq, frame)` packet. Frames are
   READ-ONLY to consumers — copy before mutating.
@@ -94,6 +98,13 @@ publish per hand-off, GIL-safe, latest-frame-wins):
   the two threads' latest published values, composites + draws HUD + feeds sinks,
   paced to `TARGET_FPS` (30) via a post-work `cv2.waitKey` of the remaining
   budget. Never blocks on the camera (reuses the last frame if none is newer).
+- **Speech thread** (`SpeechWorker`, Phase 12, OPTIONAL — only when `--speech`):
+  OWNS the mic stream + the ASR engine. Pulls ~0.2s mic blocks, segments phrases
+  by energy-VAD, transcribes only finalized phrases, and publishes an immutable
+  rolling `Transcript` (one atomic ref store, latest-wins) plus an optional
+  `on_phrase` callback per phrase. Fully off the main loop, so a ~1s transcribe
+  never drops render/tracking FPS. NOTE: `on_phrase` runs ON the speech thread.
+  Bracketed by `speech_session()`; a missing mic / no engine degrades to no-op.
 
 ## Conventions
 - Every phase in `plan.md` must leave the app runnable — no half-wired states.
@@ -122,6 +133,20 @@ publish per hand-off, GIL-safe, latest-frame-wins):
   thresholds). Persisted + resolved with the same CLI > config > default rule.
 - `--gpu` requests MediaPipe's built-in GPU delegate and falls back to CPU with a one-line notice when it's unavailable — which is the expected case for MediaPipe's Python wheels on Windows. A full ONNX Runtime / TensorRT port of the hand model is deferred to Chunk 3.
 - Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+).
+- Speech (Phase 12, `--speech`, `src/speech.py`): `select_engine` tries **Moonshine
+  first, then faster-whisper, then no-speech**, each fallback a one-line notice
+  (degrade, never die — the app's failure policy). Every heavy dep
+  (`moonshine_onnx`, `faster_whisper`, `sounddevice`) is imported LAZILY inside
+  the class that needs it, so the base pipeline runs with NONE installed (mirrors
+  the deferred `pyvirtualcam` import). Install: `pip install sounddevice
+  faster-whisper` and, for the preferred engine, `pip install
+  useful-moonshine-onnx` (the PyPI wheel — the moonshine repo's git-subdirectory
+  install no longer builds). A missing/failed mic prints one stderr notice and the
+  worker exits cleanly. The `on_phrase` callback (and the console `[speech]` print)
+  runs ON the speech thread — keep it cheap/thread-safe. Energy-VAD constants live
+  at the top of `src/speech.py` (`VAD_RMS_THRESHOLD`, `SILENCE_GAP_SECONDS`,
+  `MAX_PHRASE_SECONDS`, `ROLLING_TRANSCRIPT_SIZE`); only finalized phrases are
+  transcribed (no streaming) to keep CPU/latency low.
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
   confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it

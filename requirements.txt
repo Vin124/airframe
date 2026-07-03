@@ -4,3 +4,13 @@ numpy
 pytest
 pyvirtualcam
 windows-capture
+
+# --- Optional: speech layer (Phase 12, run with --speech). The base pipeline
+# runs without any of these installed (all imported lazily); they are heavy,
+# so install them only when you want live transcription:
+#   pip install sounddevice faster-whisper useful-moonshine-onnx
+# sounddevice: PortAudio mic capture (16 kHz mono float32)
+# faster-whisper: fallback ASR engine (CPU int8, base.en)
+# useful-moonshine-onnx: preferred ASR engine (model 'moonshine/base') -- use
+#   the PyPI wheel; the git-subdirectory install from the moonshine repo README
+#   no longer builds since the repo was restructured.
