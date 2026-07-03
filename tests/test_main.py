@@ -7,6 +7,7 @@ webcam/display access happens until run() is called).
 
 import pytest
 
+from src.interaction import GrabState, InteractionState, ResizeState
 from src.main import (
     MODE_IMAGE,
     MODE_SKELETON,
@@ -18,7 +19,29 @@ from src.main import (
     _toggle_skeleton,
     parse_args,
 )
-from src.overlay import GrabState, InteractionState, ResizeState, Transform
+from src.scene import Layer, Scene, Transform
+from src.sources.base import Size, Source
+
+
+class _FakeSource(Source):
+    """Minimal Source for building a selected image layer in key-handling tests."""
+
+    def __init__(self, base_size: Size = (10, 10)) -> None:
+        self._base_size = base_size
+
+    def read(self):
+        return None
+
+    @property
+    def base_size(self) -> Size:
+        return self._base_size
+
+
+def _scene(transform=None) -> Scene:
+    """A single-layer selected scene, centered by default."""
+    return Scene.single(
+        Layer(source=_FakeSource(), transform=transform if transform is not None else Transform())
+    )
 
 
 def test_skeleton_mode_does_not_require_image():
@@ -66,35 +89,43 @@ def test_toggle_skeleton_other_key_leaves_state_unchanged():
 
 
 def test_handle_image_key_scale_up():
-    state = InteractionState.initial()
-    result = _handle_image_key(SCALE_UP_KEYS[0], state)
-    assert result.transform.scale > state.transform.scale
+    scene = _scene()
+    before = scene.selected_layer.transform.scale
+    result_scene, _interaction = _handle_image_key(SCALE_UP_KEYS[0], scene, InteractionState.initial())
+    assert result_scene.selected_layer.transform.scale > before
 
 
 def test_handle_image_key_scale_down():
-    state = InteractionState.initial()
-    result = _handle_image_key(SCALE_DOWN_KEYS[0], state)
-    assert result.transform.scale < state.transform.scale
+    scene = _scene()
+    before = scene.selected_layer.transform.scale
+    result_scene, _interaction = _handle_image_key(SCALE_DOWN_KEYS[0], scene, InteractionState.initial())
+    assert result_scene.selected_layer.transform.scale < before
 
 
 def test_handle_image_key_other_key_is_a_noop():
-    state = InteractionState.initial()
-    result = _handle_image_key(ord("x"), state)
-    assert result == state
+    scene = _scene()
+    interaction = InteractionState.initial()
+    result_scene, result_interaction = _handle_image_key(ord("x"), scene, interaction)
+    assert result_scene is scene
+    assert result_interaction is interaction
 
 
 def test_handle_image_key_reset_recenters_transform():
-    moved = InteractionState.initial().with_transform(Transform(center_x=0.1, center_y=0.9, scale=3.0))
-    result = _handle_image_key(RESET_TRANSFORM_KEY, moved)
-    assert (result.transform.center_x, result.transform.center_y, result.transform.scale) == (0.5, 0.5, 1.0)
+    scene = _scene(Transform(center_x=0.1, center_y=0.9, scale=3.0))
+    result_scene, _interaction = _handle_image_key(RESET_TRANSFORM_KEY, scene, InteractionState.initial())
+    t = result_scene.selected_layer.transform
+    assert (t.center_x, t.center_y, t.scale) == (0.5, 0.5, 1.0)
 
 
 def test_handle_image_key_reset_also_idles_grab_and_resize():
+    scene = _scene(Transform(center_x=0.2, center_y=0.2, scale=2.0))
     grabbed = InteractionState(
-        transform=Transform(center_x=0.2, center_y=0.2, scale=2.0),
         grab=GrabState(is_grabbed=True, offset=(0.1, 0.1), was_pinching=True),
         resize=ResizeState(is_resizing=True, start_distance=0.3, start_scale=2.0),
     )
-    result = _handle_image_key(RESET_TRANSFORM_KEY, grabbed)
-    assert result.grab.is_grabbed is False
-    assert result.resize.is_resizing is False
+    result_scene, result_interaction = _handle_image_key(RESET_TRANSFORM_KEY, scene, grabbed)
+    assert result_interaction.grab.is_grabbed is False
+    assert result_interaction.resize.is_resizing is False
+    # Transform is recentered on the selected layer too.
+    t = result_scene.selected_layer.transform
+    assert (t.center_x, t.center_y, t.scale) == (0.5, 0.5, 1.0)

@@ -1,31 +1,38 @@
-"""Entry point: argument parsing, mode dispatch, and the main capture loop.
+"""Entry point: argument parsing, mode dispatch, and the main pipeline loop.
 
-Skeleton mode runs live MediaPipe hand tracking, draws a 21-point skeleton
-over the mirrored feed, and overlays a pinch/grab gesture debug label. Image
-mode composites an image over the feed and lets you pinch-grab/move it, scale
-it with +/- keys, and two-hand-pinch to resize (see ``src.overlay``). Both
-modes mirror the feed, show it in a window, print FPS, draw a small HUD
-(mode/FPS/gesture/key legend), and quit on 'q'.
+The app is a small pipeline: a webcam ``Source`` produces the background frame,
+a ``Scene`` of ``Layer`` objects is composited over it, and the result goes to a
+preview ``Sink``. Hand tracking + gesture detection drive interaction on the
+selected layer.
+
+Skeleton mode runs live MediaPipe hand tracking over an empty scene, drawing a
+21-point skeleton and a pinch/grab gesture debug label on the mirrored feed.
+Image mode adds one image ``Layer`` you can pinch-grab/move, scale with +/-
+keys, and two-hand-pinch to resize (see ``src.interaction``). Both modes mirror
+the feed (in ``WebcamSource``), show it via ``PreviewSink``, print FPS, draw a
+small HUD (mode/FPS/gesture/key legend), and quit on 'q'.
 """
 
 import argparse
 import sys
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import cv2
 
-from src import hud
-from src.camera import Camera, CameraError
+from src import compositor, hud
+from src.camera import CameraError
 from src.fps import FpsCounter
-from src.gestures import GestureDetector
+from src.gestures import GestureDetector, GestureState
 from src.hand_tracker import HandTracker, HandTrackerError
-from src.overlay import InteractionState, Overlay, OverlayError, step
+from src.interaction import InteractionState, step
+from src.scene import Layer, Scene, Transform
+from src.sinks import PreviewSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
+from src.sources import ImageSource, SourceError, WebcamSource
 
 WINDOW_NAME = "handy"
 QUIT_KEY = "q"
 WAIT_KEY_DELAY_MS = 1
-MIRROR_FLIP_CODE = 1  # cv2.flip code for a horizontal (selfie-view) flip
 
 MODE_SKELETON = "skeleton"
 MODE_IMAGE = "image"
@@ -70,63 +77,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
-def process_frame(frame, args: argparse.Namespace, tracker, gesture_detector=None, draw_debug=True):
-    """Skeleton-mode per-frame hook, run on the already-mirrored frame.
+def _detect_gestures(
+    tracker: HandTracker, frame, detectors: List[GestureDetector]
+) -> Tuple[list, List[GestureState]]:
+    """Detect hands and feed hand slot ``i`` to ``detectors[i]``.
 
-    Detects hands and always computes gesture state (needed for the HUD even
-    when the skeleton overlay is toggled off); drawing the skeleton + debug
-    label/pinch dot is gated on ``draw_debug`` so the 's' key can hide the
-    overlay without stopping gesture tracking. ``tracker`` is a HandTracker
-    and ``gesture_detector`` a GestureDetector; only the first detected hand
-    is fed to it (single-hand MVP). Image mode is handled separately by
-    ``_process_image_frame`` because it threads persistent interaction state.
-
-    Returns ``(frame, gesture_state, hand_present)``; ``gesture_state`` is
-    None when there's no gesture detector.
-    """
-    gesture_state = None
-    hand_present = False
-    if args.mode == MODE_SKELETON and tracker is not None:
-        hands = tracker.detect(frame)
-        hand_present = bool(hands)
-        if draw_debug:
-            draw_skeleton(frame, hands)
-        if gesture_detector is not None:
-            first_hand = hands[0] if hands else None
-            gesture_state = gesture_detector.update(first_hand)
-            if draw_debug and first_hand is not None:
-                draw_gesture_debug(frame, gesture_state)
-    return frame, gesture_state, hand_present
-
-
-def _process_image_frame(frame, tracker, detectors, overlay, interaction, draw_debug):
-    """Advance image mode one frame; composite the overlay; return updated state.
-
-    Detects up to two hands and feeds hand slot ``i`` to ``detectors[i]``.
-    NOTE: MediaPipe may swap hand order between frames, so a hand can jump
-    detector slots; that's accepted MVP jitter (see CLAUDE.md). Drawing the
-    skeleton + debug label is gated on ``draw_debug`` (the 's' toggle /
-    --debug-skeleton flag) but gesture state is always computed for the HUD.
-
-    Returns ``(interaction, gesture_states, hand_present)`` where
-    ``hand_present`` reflects whether the primary hand (slot 0) was tracked
-    this frame.
+    Returns ``(hands, gesture_states)`` where ``gesture_states`` is one per
+    detector (slot 0 = primary hand). NOTE: MediaPipe may swap hand order
+    between frames, so a hand can jump detector slots; that's accepted MVP
+    jitter (see CLAUDE.md).
     """
     hands = tracker.detect(frame)
     gesture_states = [
         detector.update(hands[i] if i < len(hands) else None)
         for i, detector in enumerate(detectors)
     ]
+    return hands, gesture_states
 
-    frame_size = (frame.shape[1], frame.shape[0])
-    interaction = step(interaction, overlay, gesture_states, frame_size)
-    overlay.composite(frame, interaction.transform)
 
-    if draw_debug:
-        draw_skeleton(frame, hands)
-        if hands:
-            draw_gesture_debug(frame, gesture_states[0])
-    return interaction, gesture_states, bool(hands)
+def _draw_debug(frame, hands, gesture_state: Optional[GestureState]) -> None:
+    """Draw the skeleton and (if a hand is present) the gesture debug label."""
+    draw_skeleton(frame, hands)
+    if hands and gesture_state is not None:
+        draw_gesture_debug(frame, gesture_state)
 
 
 def _toggle_skeleton(key: int, show_skeleton: bool) -> bool:
@@ -136,64 +109,78 @@ def _toggle_skeleton(key: int, show_skeleton: bool) -> bool:
     return show_skeleton
 
 
-def _handle_image_key(key: int, interaction: InteractionState) -> InteractionState:
+def _handle_image_key(
+    key: int, scene: Scene, interaction: InteractionState
+) -> Tuple[Scene, InteractionState]:
     """Apply the image-mode-only keys: '+/-' scale and 'r' transform reset.
 
-    Reset returns a full ``InteractionState.initial()`` (transform recentered
-    AND grab/resize idled) rather than just the transform, so a reset mid-grab
-    can't leave a stale grab offset that would otherwise yank the image back
-    out of center on the next tracked frame.
+    Scaling multiplies the selected layer's transform. Reset recenters the
+    selected layer AND idles grab/resize (returns a fresh ``InteractionState``)
+    rather than just the transform, so a reset mid-grab can't leave a stale grab
+    offset that would otherwise yank the image back out of center on the next
+    tracked frame. No-op (returns the inputs) when nothing is selected.
     """
+    layer = scene.selected_layer
+    if layer is None:
+        return scene, interaction
+
     if key in SCALE_UP_KEYS:
-        return interaction.with_transform(interaction.transform.scaled_by(KEYBOARD_SCALE_STEP))
+        scaled = layer.with_transform(layer.transform.scaled_by(KEYBOARD_SCALE_STEP))
+        return scene.replace_selected(scaled), interaction
     if key in SCALE_DOWN_KEYS:
-        return interaction.with_transform(interaction.transform.scaled_by(1.0 / KEYBOARD_SCALE_STEP))
+        scaled = layer.with_transform(layer.transform.scaled_by(1.0 / KEYBOARD_SCALE_STEP))
+        return scene.replace_selected(scaled), interaction
     if key == RESET_TRANSFORM_KEY:
-        return InteractionState.initial()
-    return interaction
+        reset = layer.with_transform(Transform())
+        return scene.replace_selected(reset), InteractionState.initial()
+    return scene, interaction
 
 
 def _init_mode(args: argparse.Namespace):
     """Build per-mode state BEFORE opening the camera.
 
-    Returns ``(tracker, gesture_detector, detectors, overlay, interaction)``
-    with the unused slots as None. Loads the overlay image first in image mode
-    so a missing/unreadable file fails fast, before any camera or model work.
-    Exits nonzero with a clear message on overlay/tracker init failure.
+    Returns ``(tracker, detectors, scene, interaction)``. Skeleton mode gets a
+    single detector and an empty scene (no image layer, so the compositor is a
+    no-op); ``interaction`` is None there. Image mode loads the overlay image
+    first -- so a missing/unreadable file fails fast, before any camera or model
+    work -- and builds a single-layer selected scene. Exits nonzero with a clear
+    message on image/tracker init failure.
     """
     try:
         if args.mode == MODE_SKELETON:
             tracker = HandTracker()
-            return tracker, GestureDetector(), None, None, None
+            return tracker, [GestureDetector()], Scene(), None
 
-        overlay = Overlay.load(args.image)  # fail fast on a bad image path
+        source = ImageSource.load(args.image)  # fail fast on a bad image path
         tracker = HandTracker(num_hands=IMAGE_MODE_NUM_HANDS)
         detectors = [GestureDetector() for _ in range(IMAGE_MODE_NUM_HANDS)]
-        return tracker, None, detectors, overlay, InteractionState.initial()
-    except (HandTrackerError, OverlayError) as exc:
+        scene = Scene.single(Layer(source=source, transform=Transform()))
+        return tracker, detectors, scene, InteractionState.initial()
+    except (HandTrackerError, SourceError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 def run(args: argparse.Namespace) -> None:
-    """Open the webcam and run the capture/display/quit loop until 'q' or failure.
+    """Open the webcam and run the capture/composite/display/quit loop.
 
     ``show_skeleton`` starts True in skeleton mode (skeleton is the point of
-    that mode) and from --debug-skeleton in image mode (off by default
-    there); the 's' key flips it at runtime in both modes. ``last_fps`` holds
-    the most recent FpsCounter reading for the HUD, since ``tick()`` only
-    returns a fresh value once per reporting interval and None otherwise.
+    that mode) and from --debug-skeleton in image mode (off by default there);
+    the 's' key flips it at runtime in both modes. ``last_fps`` holds the most
+    recent FpsCounter reading for the HUD, since ``tick()`` only returns a fresh
+    value once per reporting interval and None otherwise.
     """
-    tracker, gesture_detector, detectors, overlay, interaction = _init_mode(args)
+    tracker, detectors, scene, interaction = _init_mode(args)
 
     show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
     last_fps: Optional[float] = None
+    preview = PreviewSink(WINDOW_NAME)
 
     try:
-        with Camera() as camera:
+        with WebcamSource() as webcam:
             fps_counter = FpsCounter()
             while True:
-                frame = camera.read()
+                frame = webcam.read()  # already mirrored (selfie view)
                 if frame is None:
                     print(
                         "Warning: failed to read frame from webcam (stream ended "
@@ -202,21 +189,30 @@ def run(args: argparse.Namespace) -> None:
                     )
                     break
 
-                # Mirror first, then detect, so drawn landmarks align with the view.
-                frame = cv2.flip(frame, MIRROR_FLIP_CODE)
-                if args.mode == MODE_SKELETON:
-                    frame, gesture_state, hand_present = process_frame(
-                        frame, args, tracker, gesture_detector, show_skeleton
-                    )
-                    status = None
-                else:
-                    interaction, gesture_states, hand_present = _process_image_frame(
-                        frame, tracker, detectors, overlay, interaction, show_skeleton
-                    )
-                    gesture_state = gesture_states[0] if gesture_states else None
+                hands, gesture_states = _detect_gestures(tracker, frame, detectors)
+                gesture_state = gesture_states[0]
+                hand_present = bool(hands)
+
+                if args.mode == MODE_IMAGE:
+                    frame_size = (frame.shape[1], frame.shape[0])
+                    # Image mode always keeps exactly one layer selected; the
+                    # guard makes that invariant explicit rather than crashing
+                    # inside step() if it's ever broken.
+                    layer = scene.selected_layer
+                    if layer is not None:
+                        interaction, layer = step(interaction, layer, gesture_states, frame_size)
+                        scene = scene.replace_selected(layer)
                     status = hud.resize_or_grab_status(
                         interaction.grab.is_grabbed, interaction.resize.is_resizing
                     )
+                else:
+                    status = None
+
+                # Composite the scene over the webcam background (empty scene in
+                # skeleton mode = no-op), then draw debug overlays on top.
+                compositor.render(frame, scene)
+                if show_skeleton:
+                    _draw_debug(frame, hands, gesture_state)
 
                 fps = fps_counter.tick()
                 if fps is not None:
@@ -230,21 +226,21 @@ def run(args: argparse.Namespace) -> None:
                 )
                 hud.draw_hud(frame, hud.build_hud_lines(args.mode, last_fps, label, status))
 
-                cv2.imshow(WINDOW_NAME, frame)
+                preview.send(frame)
 
                 key = cv2.waitKey(WAIT_KEY_DELAY_MS) & 0xFF
                 if key == ord(QUIT_KEY):
                     break
                 show_skeleton = _toggle_skeleton(key, show_skeleton)
                 if args.mode == MODE_IMAGE:
-                    interaction = _handle_image_key(key, interaction)
+                    scene, interaction = _handle_image_key(key, scene, interaction)
     except CameraError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
         if tracker is not None:
             tracker.close()
-        cv2.destroyAllWindows()
+        preview.close()
 
 
 def main(argv=None) -> None:

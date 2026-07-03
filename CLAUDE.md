@@ -13,13 +13,25 @@ python -m src.main --mode image --image assets/test.png   # + pinch-to-grab imag
 Quit with `q`.
 
 ## Structure
+Pipeline: webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**.
 ```
-src/main.py         # entry: argparse, mode dispatch, main loop
-src/camera.py       # webcam open/read/release
-src/hand_tracker.py # MediaPipe wrapper -> 21 normalized landmarks per hand
-src/skeleton.py     # draw landmarks + connections (skeleton mode)
-src/gestures.py     # pinch/grab detection from landmarks (image mode)
-src/overlay.py      # image composite + grab/move/resize (image mode)
+src/main.py           # entry: argparse, mode dispatch, main loop (wires the pipeline)
+src/camera.py         # low-level webcam open/read/release
+src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand
+src/skeleton.py       # draw landmarks + connections (debug overlay)
+src/gestures.py       # pinch/grab detection from landmarks
+src/hud.py            # heads-up display text + strip
+src/fps.py            # frame-rate counter
+src/sources/          # frame producers (Source contract) -> latest frame as numpy array
+    base.py           #   Source ABC + SourceError
+    webcam.py         #   WebcamSource: live feed, applies the selfie mirror
+    image.py          #   ImageSource: loaded BGRA overlay image
+src/scene.py          # Transform geometry + Layer (source+transform+z_index+selected) + Scene
+src/compositor.py     # alpha-composite layers onto the webcam frame in place, by z-order
+src/interaction.py    # grab/move/resize state machines over the selected layer
+src/sinks/            # frame consumers (Sink contract)
+    base.py           #   Sink ABC
+    preview.py        #   PreviewSink: cv2.imshow window
 ```
 
 ## Conventions

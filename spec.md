@@ -27,20 +27,37 @@ Mode 2 is a superset of mode 1. Build mode 1 first, fully working, then layer mo
 - **NumPy** — array/coordinate math
 
 ## Project structure
+As of Chunk 2 / Phase 5 the loose MVP modules are refactored into a pipeline:
+webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**,
+with gesture-driven **interaction** on the selected layer. The MVP scope above
+(two modes, single hand, single image, OpenCV window only) is unchanged — this
+is purely an internal restructure so later features plug in cleanly.
 ```
 shacam-win/
 ├── CLAUDE.md
 ├── plan.md
+├── plan-2.md               # Chunk 2 phases (5-10)
 ├── requirements.txt
 ├── assets/
-│   └── test.png            # any test image for mode 2
+│   └── test.png            # any test image for image mode
 └── src/
-    ├── main.py             # entry point, arg parsing, mode dispatch, main loop
-    ├── camera.py           # webcam open/read/release wrapper
+    ├── main.py             # entry point, arg parsing, mode dispatch, main loop (wires the pipeline)
+    ├── camera.py           # low-level webcam open/read/release wrapper
     ├── hand_tracker.py     # MediaPipe wrapper -> normalized 21-landmark list
-    ├── skeleton.py         # draw landmarks + connections (mode 1)
-    ├── gestures.py         # pinch / grab detection from landmarks (mode 2)
-    └── overlay.py          # image overlay + grab/move/resize logic (mode 2)
+    ├── skeleton.py         # draw landmarks + connections (debug overlay)
+    ├── gestures.py         # pinch / grab detection from landmarks
+    ├── hud.py              # heads-up display text + strip
+    ├── fps.py              # frame-rate counter
+    ├── sources/            # frame producers (Source contract) -> latest frame as numpy array
+    │   ├── base.py         #   Source ABC + SourceError
+    │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror
+    │   └── image.py        #   ImageSource: loaded BGRA overlay image
+    ├── scene.py            # Transform geometry + Layer (source+transform+z_index+selected) + Scene
+    ├── compositor.py       # alpha-composite layers onto the webcam frame in place, by z-order
+    ├── interaction.py      # grab/move/resize state machines over the selected layer
+    └── sinks/              # frame consumers (Sink contract)
+        ├── base.py         #   Sink ABC
+        └── preview.py      #   PreviewSink: cv2.imshow window
 ```
 
 ## How to run

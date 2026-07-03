@@ -60,7 +60,7 @@ def resize_or_grab_status(is_grabbed: bool, is_resizing: bool) -> Optional[str]:
     """Return the image-mode interaction status label, or None when idle.
 
     Resize takes priority in the (impossible in practice, but cheap to be
-    defensive about) case both are true, matching ``src.overlay.step``'s own
+    defensive about) case both are true, matching ``src.interaction.step``'s own
     priority of two-hand resize over single-hand grab.
     """
     if is_resizing:
