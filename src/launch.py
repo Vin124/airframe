@@ -158,35 +158,53 @@ def _final_settings(
 
 
 def build_speech_on_phrase(parse_enabled: bool) -> Optional["PhraseCallback"]:
-    """Compose the speech ``on_phrase`` callback (the Phase 13 wiring seam).
+    """Compose the speech ``on_phrase`` callback (the Phase 13/14 wiring seam).
 
     Returns ``None`` when parsing is off, so ``speech_session`` keeps its default
     callback (which prints the live ``[speech]`` transcript). When on, returns a
-    callback that BOTH prints that live transcript AND runs the LLM parser,
-    logging ``[parser] {...}`` for actionable phrases only (non-actionable /
-    failed parses return ``None`` and are ignored).
+    callback that prints that live transcript, runs the LLM parser (logging
+    ``[parser] {...}`` for actionable phrases only), and -- for ``retrieve``-routed
+    requests (Phase 14) -- fetches the image and logs ``[retriever] got <WxH>
+    image for '<query>' from <source>`` (or ``[retriever] no image for
+    '<query>'``). Non-actionable / failed parses return ``None`` and are ignored;
+    ``generate``-routed requests are left for Phase 16.
 
     THREADING: this callback runs on the SPEECH thread (``SpeechWorker`` invokes
-    ``on_phrase`` there, never the render loop). The ``RequestParser.parse`` LLM
-    call BLOCKS for a few hundred ms, which is fine off the render thread; its
-    bounded HTTP timeout plus the worker's bounded ``stop()`` join ensure a slow
-    or failed call can never wedge app shutdown. Kept in the launch layer so the
-    parser is composed once here rather than threaded through many layers. The
-    parser + speech imports are deferred so a headless import of this module (and
-    its unit tests) doesn't pull them in.
+    ``on_phrase`` there, never the render loop). Both ``RequestParser.parse`` and
+    ``Retriever.retrieve`` BLOCK on the network for up to their bounded timeouts,
+    which is fine off the render thread and can't stall render/tracking FPS; the
+    worker's bounded ``stop()`` join keeps a slow call from wedging shutdown. Kept
+    in the launch layer so the parser + retriever are composed once here rather
+    than threaded through many layers. The parser/retriever/speech imports are
+    deferred so a headless import of this module (and its unit tests) doesn't pull
+    them in.
     """
     if not parse_enabled:
         return None
-    from src.parser import build_request_parser
+    from src.parser import ROUTE_RETRIEVE, build_request_parser
+    from src.retriever import build_retriever
     from src.speech import default_on_phrase
 
     parser = build_request_parser()
+    retriever = build_retriever()
 
     def on_phrase(text: str) -> None:
         default_on_phrase(text)  # preserve the Phase 12 live-transcript line
         request = parser.parse(text)
-        if request is not None and request.is_actionable:
-            print(f"[parser] {request}")
+        if request is None or not request.is_actionable:
+            return
+        print(f"[parser] {request}")
+        if request.route != ROUTE_RETRIEVE:
+            return  # generate-routed requests are Phase 16, nothing to fetch here
+        asset = retriever.retrieve(request)
+        if asset is None:
+            print(f"[retriever] no image for '{request.query}'")
+            return
+        height, width = asset.bgra.shape[:2]
+        print(
+            f"[retriever] got {width}x{height} image for "
+            f"'{request.query}' from {asset.source_name}"
+        )
 
     return on_phrase
 

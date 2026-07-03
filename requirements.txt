@@ -24,3 +24,12 @@ windows-capture
 #   3. `ollama serve` (or let the Ollama app run it) so localhost:11434 answers
 # Without a reachable server the parser degrades to one stderr notice per
 # phrase and the app keeps running with --speech's transcript-only output.
+
+# --- Optional: retriever web-search fallback (Phase 14, run with --speech
+# --parse). The DEFAULT Wikimedia Commons backend needs NO new dependency
+# (src/retriever.py speaks the MediaWiki API + downloads images over the stdlib
+# `urllib.request`). Only the web-search FALLBACK (used when Wikimedia returns
+# nothing) needs `ddgs`; it's imported lazily, so its absence just disables that
+# fallback and prints one notice:
+#   pip install ddgs
+# ddgs: keyless DuckDuckGo search (the maintained successor to duckduckgo_search).

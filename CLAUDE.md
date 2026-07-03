@@ -60,6 +60,7 @@ src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; -
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
 src/speech.py         # SpeechWorker: mic capture + energy-VAD phrase segmentation + ASR (Moonshine -> faster-whisper fallback) on its own thread (Phase 12); pure VAD + rolling-transcript helpers; deferred deps; speech_session() launch glue
 src/parser.py          # RequestParser: one finalized phrase -> a strict-JSON structured ParsedRequest via a local Ollama model (Phase 13); pure prompt-build + JSON-extract + enum-normalize helpers are the security boundary; OllamaClient speaks Ollama's HTTP API over stdlib urllib (no new dep); wired as (part of) the speech thread's on_phrase callback, see src/launch.py's build_speech_on_phrase
+src/retriever.py       # Retriever: a parsed retrieve request -> a downloaded, decoded BGRA RetrievedAsset (Phase 14). Swappable RetrievalSource backends: WikimediaSource (default, MediaWiki Commons API, stdlib urllib, no dep) -> WebSearchSource (fallback, DuckDuckGo via lazily-imported ddgs) with an optional LocalLibrarySource (filename-substring, CLIP deferred) tried first. select_best_image + decode_to_bgra + is_allowed_url are pure/unit-tested; remote URLs come from search + are only lightly validated (scheme/size/timeout/dim caps). Runs on the SPEECH thread via build_speech_on_phrase; never touches the scene (that's Phase 15)
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
 src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
@@ -170,6 +171,24 @@ hand-off, GIL-safe, latest-frame-wins):
   (`/api/generate`, `format="json"`, temperature 0) via stdlib `urllib.request`
   — only the separate Ollama application + a pulled small model are required
   at runtime (see `requirements.txt`).
+- Retriever (Phase 14, `src/retriever.py`, reached via `--speech --parse` when a
+  parsed request is `route="retrieve"`): `WikimediaSource` is the DEFAULT (query
+  the Commons MediaWiki API, `select_best_image` picks the best licensed raster
+  image + attribution, stdlib `urllib` only, NO new dep); `WebSearchSource` is
+  the fallback for misses (DuckDuckGo via the OPTIONAL `ddgs` package, imported
+  lazily so its absence only disables the fallback -- `pip install ddgs`); an
+  optional `LocalLibrarySource` (filename-substring match, CLIP embeddings
+  deferred) is tried first if configured. Composition is source-hint ordered with
+  fallback: `wikimedia` -> [wikimedia, websearch], `websearch` -> [websearch,
+  wikimedia]. Remote images come from SEARCH and are UNTRUSTED -- only LIGHTLY
+  validated for this debug harness: http/https scheme only (`is_allowed_url`
+  rejects file/ftp/data), a 20 MB download cap, a 10 s timeout, and a 1024 px max
+  dimension (downscaled; also requested server-side via `iiurlwidth`). Downloads
+  land in `<tempdir>/shacam_cache`; the decoded BGRA is the in-hand asset.
+  `Retriever.retrieve` NEVER raises (degrade-never-die): a no-result/network
+  error returns `None` + a notice. It runs ON THE SPEECH thread (blocking network
+  is fine there, NEVER on the render loop) and does NOT spawn into the scene yet
+  (that's Phase 15).
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
 - Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
   confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it
