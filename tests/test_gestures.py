@@ -7,6 +7,7 @@ from src.gestures import (
     GestureState,
     PINCH_ENTER_THRESHOLD,
     PINCH_EXIT_THRESHOLD,
+    detect_draw_pose,
     detect_grab,
     pinch_distance_and_midpoint,
 )
@@ -17,6 +18,15 @@ INDEX_TIP = 8
 MIDDLE_TIP = 12
 RING_TIP = 16
 PINKY_TIP = 20
+
+# PIP joints (per src.gestures topology).
+INDEX_PIP = 6
+MIDDLE_PIP = 10
+RING_PIP = 14
+PINKY_PIP = 18
+
+# Air-drawing confirmation window (mirrors src.gestures._DRAW_CONFIRM_FRAMES).
+DRAW_CONFIRM_FRAMES = 3
 
 
 def _open_hand() -> list:
@@ -239,3 +249,98 @@ def test_detector_resets_pinch_state_after_hand_lost():
     drifted_hand[INDEX_TIP] = (0.5, 0.5 + mid_distance, 0.0)
 
     assert detector.update(drifted_hand).is_pinching is False
+
+
+# --------------------------------------------------------------------------- #
+# Air-drawing pose (Phase 11): detect_draw_pose math + GestureDetector hysteresis
+# --------------------------------------------------------------------------- #
+
+def _draw_pose_hand() -> list:
+    """A "pointing" hand: index extended, middle/ring/pinky curled toward palm.
+
+    Wrist low (y=0.9); the index tip reaches up past its PIP (extended) while the
+    other three tips fold back below their PIP joints (closer to the wrist).
+    """
+    hand = [(0.0, 0.0, 0.0)] * 21
+    hand[WRIST] = (0.5, 0.9, 0.0)
+    hand[THUMB_TIP] = (0.35, 0.6, 0.0)
+    # Index extended: tip (dist 0.75) beyond its PIP (dist 0.4).
+    hand[INDEX_PIP] = (0.5, 0.5, 0.0)
+    hand[INDEX_TIP] = (0.5, 0.15, 0.0)
+    # Middle/ring/pinky curled: tip (dist ~0.2) inside its PIP (dist ~0.45).
+    for pip_idx, tip_idx in ((MIDDLE_PIP, MIDDLE_TIP), (RING_PIP, RING_TIP), (PINKY_PIP, PINKY_TIP)):
+        hand[pip_idx] = (0.5, 0.45, 0.0)
+        hand[tip_idx] = (0.5, 0.70, 0.0)
+    return hand
+
+
+def test_detect_draw_pose_true_for_pointing_hand():
+    assert detect_draw_pose(_draw_pose_hand()) is True
+
+
+def test_detect_draw_pose_false_for_open_hand():
+    # All fingers extended -> nothing curled -> not a draw pose.
+    assert detect_draw_pose(_open_hand()) is False
+
+
+def test_detect_draw_pose_false_for_fist():
+    # Index curled too (fist) -> index not extended -> not a draw pose.
+    assert detect_draw_pose(_curled_hand()) is False
+
+
+def test_detector_draw_confirms_only_after_n_frames():
+    detector = GestureDetector()
+    hand = _draw_pose_hand()
+    # The latch stays off until the pose is held for the full confirmation window.
+    for _ in range(DRAW_CONFIRM_FRAMES - 1):
+        assert detector.update(hand).is_draw is False
+    assert detector.update(hand).is_draw is True
+
+
+def test_detector_draw_releases_after_n_non_draw_frames():
+    detector = GestureDetector()
+    hand = _draw_pose_hand()
+    for _ in range(DRAW_CONFIRM_FRAMES):
+        detector.update(hand)
+    assert detector.update(hand).is_draw is True  # firmly drawing
+
+    open_hand = _open_hand()
+    for _ in range(DRAW_CONFIRM_FRAMES - 1):
+        assert detector.update(open_hand).is_draw is True  # debounced, still on
+    assert detector.update(open_hand).is_draw is False  # released after N frames
+
+
+def test_detector_draw_survives_a_single_spurious_non_draw_frame():
+    detector = GestureDetector()
+    hand = _draw_pose_hand()
+    for _ in range(DRAW_CONFIRM_FRAMES):
+        detector.update(hand)
+    assert detector.update(hand).is_draw is True
+    # One stray non-draw frame must not drop the stroke (streak < confirm)...
+    assert detector.update(_open_hand()).is_draw is True
+    # ...and returning to the pose resets the release streak entirely.
+    assert detector.update(hand).is_draw is True
+
+
+def test_detector_draw_resets_on_hand_loss():
+    detector = GestureDetector()
+    hand = _draw_pose_hand()
+    for _ in range(DRAW_CONFIRM_FRAMES):
+        detector.update(hand)
+    assert detector.update(hand).is_draw is True
+    # Hand lost -> immediate hard reset (no debounce), like the pinch latch.
+    assert detector.update(None).is_draw is False
+
+
+def test_detector_publishes_index_tip_as_draw_point():
+    detector = GestureDetector()
+    state = detector.update(_draw_pose_hand())
+    assert state.draw_point == pytest.approx((0.5, 0.15))  # index tip (x, y)
+
+
+def test_detector_no_hand_draw_point_is_origin():
+    assert detector_no_hand_state().draw_point == (0.0, 0.0)
+
+
+def detector_no_hand_state() -> GestureState:
+    return GestureDetector().update(None)

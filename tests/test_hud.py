@@ -71,7 +71,7 @@ def test_build_hud_lines_includes_mode_fps_gesture_and_legend():
     assert lines[0] == "Mode: skeleton"
     assert lines[1] == "FPS: 30.0"
     assert lines[2] == f"Gesture: {GESTURE_LABEL_OPEN}"
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
 
 
 def test_build_hud_lines_no_fps_yet_shows_placeholder():
@@ -88,7 +88,7 @@ def test_build_hud_lines_status_included_when_present():
     lines = build_hud_lines("image", 60.0, GESTURE_LABEL_PINCH, status=STATUS_GRABBED)
     assert f"Status: {STATUS_GRABBED}" in lines
     # Legend still comes last even with an extra status line.
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
 
 
 def test_build_hud_lines_virtualcam_omitted_by_default():
@@ -99,13 +99,13 @@ def test_build_hud_lines_virtualcam_omitted_by_default():
 def test_build_hud_lines_virtualcam_on():
     lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=True)
     assert f"VirtualCam: {VIRTUALCAM_ON}" in lines
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
 
 
 def test_build_hud_lines_virtualcam_off():
     lines = build_hud_lines("skeleton", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=False)
     assert f"VirtualCam: {VIRTUALCAM_OFF}" in lines
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
 
 
 def test_build_hud_lines_virtualcam_and_status_both_present_before_legend():
@@ -114,7 +114,7 @@ def test_build_hud_lines_virtualcam_and_status_both_present_before_legend():
     )
     assert f"Status: {STATUS_GRABBED}" in lines
     assert f"VirtualCam: {VIRTUALCAM_ON}" in lines
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +139,7 @@ def test_build_hud_lines_includes_timing_line_before_legend():
         "image", 30.0, GESTURE_LABEL_OPEN, virtualcam_active=False, timing_line=timing
     )
     assert timing in lines
-    # Legend still the last two lines even with the timing line added.
-    assert tuple(lines[-2:]) == KEY_LEGEND_LINES
+    # Legend still the last lines even with the timing line added.
+    assert tuple(lines[-len(KEY_LEGEND_LINES):]) == KEY_LEGEND_LINES
     # Timing line sits just above the legend.
-    assert lines[-3] == timing
+    assert lines[-(len(KEY_LEGEND_LINES) + 1)] == timing

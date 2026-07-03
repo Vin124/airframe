@@ -62,3 +62,26 @@ class ImageSource(Source):
     def base_size(self) -> Size:
         """Native (width, height) of the image in pixels."""
         return self._image.shape[1], self._image.shape[0]
+
+
+class ArraySource(Source):
+    """A ``Source`` backed by an in-memory BGRA array (no file involved).
+
+    Used by air-drawing (Phase 11) to wrap a freshly rasterized stroke so it can
+    be dropped into the scene as a normal ``Layer`` -- the same BGRA-overlay
+    contract as ``ImageSource``, minus the disk load. The array is normalized to
+    BGRA once (``ensure_bgra``) and returned unchanged on every ``read()``, so
+    the compositor and interaction code treat it identically to a loaded image.
+    """
+
+    def __init__(self, image_bgra: np.ndarray) -> None:
+        self._image = ensure_bgra(image_bgra)
+
+    def read(self) -> np.ndarray:
+        """Return the wrapped BGRA image (same array every call)."""
+        return self._image
+
+    @property
+    def base_size(self) -> Size:
+        """Native (width, height) of the image in pixels."""
+        return self._image.shape[1], self._image.shape[0]

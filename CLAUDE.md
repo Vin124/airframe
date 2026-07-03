@@ -35,7 +35,11 @@ Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
 `v` toggle virtual cam. Image-mode multi-layer: `a`/`w`/`m` add an image / window
 / screen layer (reusing the launch args), `x` remove the selected layer, `f`
 bring it to the front. A pinch grabs the top-most layer under the pinch point;
-the selected layer is outlined.
+the selected layer is outlined. Image-mode air-drawing (Phase 11): hold the draw
+pose (index extended, other fingers curled) and move your fingertip to draw a
+smoothed stroke; release the pose to freeze it into a grabbable/movable layer.
+`c` clears the in-progress stroke, `k` cycles stroke color, `[` / `]` step the
+stroke width down / up.
 
 ## Structure
 Pipeline: webcam **source** -> **scene** of layers -> **compositor** -> preview **sink**.
@@ -51,7 +55,8 @@ src/hand_tracker.py   # MediaPipe wrapper -> 21 normalized landmarks per hand; -
 src/tracking.py       # TrackingWorker: hand tracking + gesture hysteresis on its own thread (Phase 9)
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
-src/gestures.py       # pinch/grab detection from landmarks; per-instance enter/exit thresholds (live-tunable)
+src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
+src/drawing.py        # air-drawing (Phase 11): immutable Stroke + smoothing + rasterize-to-BGRA + bbox->Transform placement + live overlay; pure numpy/cv2
 src/tuning.py         # dependency-light GestureTuning + TrackerConfidence snapshots + clamp_tuning (the one hysteresis-gap boundary, shared by panel + config)
 src/window_list.py    # list_window_titles(): open top-level window titles via ctypes EnumWindows (panel dropdown); injectable + failure-safe ([])
 src/hud.py            # heads-up display text + strip (incl. per-stage timing line)
@@ -62,7 +67,7 @@ src/sources/          # frame producers (Source contract) -> latest frame as num
     base.py           #   Source ABC + SourceError
     webcam.py         #   WebcamSource: live feed, applies the selfie mirror (blocking read)
     threaded.py       #   ThreadedSource: runs any blocking Source on a capture thread (Phase 9)
-    image.py          #   ImageSource: loaded BGRA overlay image
+    image.py          #   ImageSource: loaded BGRA overlay image; ArraySource: in-memory BGRA (frozen air-drawing strokes)
     capture.py        #   WindowSource / MonitorSource: live Windows Graphics Capture (threaded)
 src/scene.py          # Transform geometry + Layer (source+transform+z_index+selected+layer_id) + Scene (multi-layer add/remove/raise, hit-test selection)
 src/compositor.py     # alpha-composite layers onto the webcam frame in place by z-order + draw the selected-layer highlight
@@ -118,6 +123,16 @@ publish per hand-off, GIL-safe, latest-frame-wins):
 - `--gpu` requests MediaPipe's built-in GPU delegate and falls back to CPU with a one-line notice when it's unavailable — which is the expected case for MediaPipe's Python wheels on Windows. A full ONNX Runtime / TensorRT port of the hand model is deferred to Chunk 3.
 - Virtual camera output is opt-in (`--virtualcam` flag / 'v' key) via pyvirtualcam and needs the OBS Virtual Camera backend (OBS Studio 26+).
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
+- Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
+  confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it
+  publishes `is_draw` + the index-tip `draw_point` on the frozen `GestureState`);
+  the main loop NEVER computes a gesture from raw landmarks. The accumulating
+  `Stroke` is owned by the MAIN loop (single writer of scene/interaction), which
+  appends `draw_point` while `is_draw` holds and, on release, rasterizes it
+  (`src/drawing.py`) into an `ArraySource` layer placed via `bbox_to_transform`
+  so it lands exactly where drawn. Gesture precedence: `layers.suppress_draw_pinch`
+  masks `is_pinching=False` for any drawing hand BEFORE `interaction.step`, so a
+  curled draw pose can't also start a pinch-grab. Keys c/k/[/] are image-mode only.
 - Multiple overlay layers are supported at runtime (Phase 8): add/remove layers,
   pinch to grab whichever is under the pinch point, bring-to-front, all live.
   Selection is single (exactly one active layer); layers carry a stable

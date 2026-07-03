@@ -32,7 +32,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 import cv2
 import numpy as np
 
-from src import compositor, config, hud
+from src import compositor, config, drawing, hud
+from src.drawing import (  # air-drawing keys (Phase 11), re-exported for tests
+    CLEAR_STROKE_KEY, CYCLE_COLOR_KEY, STROKE_WIDTH_DOWN_KEY, STROKE_WIDTH_UP_KEY,
+)
 from src.camera import CameraError
 from src.fps import FpsCounter
 from src.gestures import (
@@ -46,7 +49,13 @@ from src.interaction import InteractionState, step
 from src.scene import Layer, Scene, Transform
 from src.sinks import PreviewSink, SinkError, VirtualCamSink
 from src.skeleton import draw_gesture_debug, draw_skeleton
-from src.sources import Source, SourceError, ThreadedSource, WebcamSource
+from src.sources import (
+    ArraySource,
+    Source,
+    SourceError,
+    ThreadedSource,
+    WebcamSource,
+)
 from src.timing import (
     StageTimer,
     StageTimings,
@@ -97,6 +106,7 @@ from src.layers import (  # noqa: F401  (re-exported for tests / used below)
     _monitor_source_from_index,
     _remove_selected_layer,
     _window_source_from_title,
+    suppress_draw_pinch,
 )
 from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     _build_panel,
@@ -328,6 +338,13 @@ class PipelineRuntime:
         self._panel_status: Optional[str] = None  # last panel-action message
         self._panel = None  # optional Tk ControlPanel, pumped once per tick
         self._timings = StageTimings()
+        # Air-drawing state (Phase 11), owned solely by this main loop (the
+        # single writer of scene/interaction). ``_stroke`` is the in-progress
+        # path (None between strokes); color/width are the current pen settings
+        # driven by the c/k/[/] keys and baked in when a stroke freezes.
+        self._stroke: Optional[drawing.Stroke] = None
+        self._stroke_color_index = 0
+        self._stroke_width = drawing.DEFAULT_STROKE_WIDTH
 
     def run(self) -> None:
         """Loop until 'q' (or the window is closed), pacing each tick to TARGET_FPS."""
@@ -403,12 +420,80 @@ class PipelineRuntime:
             self._status = None
             return
         self.scene, self._fit_ids = _apply_pending_fit(self.scene, self._fit_ids, frame_size)
+        gesture_states = list(tracking.gesture_states)
+        # Air-drawing runs BEFORE interaction: it may freeze a released stroke
+        # into a new (selected) layer, and suppressing pinch on any drawing hand
+        # keeps that hand's curled pose from also starting a grab/resize.
+        self._advance_drawing(gesture_states, frame_size)
         self.interaction, self.scene = step(
-            self.interaction, self.scene, list(tracking.gesture_states), frame_size
+            self.interaction, self.scene, suppress_draw_pinch(gesture_states), frame_size
         )
         self._status = hud.resize_or_grab_status(
             self.interaction.grab.is_grabbed, self.interaction.resize.is_resizing
         )
+
+    def _advance_drawing(
+        self, gesture_states: list, frame_size: Tuple[int, int]
+    ) -> None:
+        """Append to / release the air-drawing stroke from the primary hand.
+
+        Single writer of the stroke (main thread): appends the published
+        index-fingertip point while ``is_draw`` holds, and freezes the stroke
+        into a scene layer the frame the pose releases. Reads only the tracking
+        thread's published gesture state -- never raw landmarks.
+        """
+        primary = gesture_states[0] if gesture_states else None
+        if primary is not None and getattr(primary, "is_draw", False):
+            active = self._stroke if self._stroke is not None else drawing.Stroke()
+            self._stroke = active.append(primary.draw_point)
+        elif self._stroke is not None:
+            self._freeze_stroke(frame_size)
+
+    def _freeze_stroke(self, frame_size: Tuple[int, int]) -> None:
+        """Rasterize the released stroke into a new, grabbable scene layer.
+
+        ``drawing.freeze_stroke`` does the pure smooth -> rasterize -> place math
+        (``None`` for a too-short stroke: a tap isn't a drawing); the result is
+        added through the normal ``Scene.add_layer`` machinery so it lands on
+        top, selected, with a stable id. Interaction is reset to idle so no
+        stale pinch edge grabs the new layer.
+        """
+        stroke = self._stroke
+        self._stroke = None
+        if stroke is None:
+            return
+        frozen = drawing.freeze_stroke(
+            stroke.points, frame_size, self._stroke_color(), self._stroke_width
+        )
+        if frozen is None:
+            return
+        bgra, transform = frozen
+        self.scene = self.scene.add_layer(Layer(source=ArraySource(bgra), transform=transform))
+        if self.interaction is not None:
+            self.interaction = InteractionState.initial()
+
+    def clear_stroke(self) -> None:
+        """Discard the in-progress stroke without freezing it (the 'c' key)."""
+        self._stroke = None
+
+    def _stroke_color(self) -> Tuple[int, int, int]:
+        """The current pen color (BGR) for the active palette index."""
+        return drawing.STROKE_PALETTE[self._stroke_color_index]
+
+    def _handle_drawing_key(self, key: int) -> None:
+        """Apply the air-drawing keys: clear ('c'), cycle color ('k'), width ('['/']')."""
+        if key == CLEAR_STROKE_KEY:
+            self.clear_stroke()
+        elif key == CYCLE_COLOR_KEY:
+            self._stroke_color_index = drawing.next_color_index(self._stroke_color_index)
+        elif key == STROKE_WIDTH_DOWN_KEY:
+            self._stroke_width = drawing.clamped_width(
+                self._stroke_width - drawing.STROKE_WIDTH_STEP
+            )
+        elif key == STROKE_WIDTH_UP_KEY:
+            self._stroke_width = drawing.clamped_width(
+                self._stroke_width + drawing.STROKE_WIDTH_STEP
+            )
 
     def _composite(self, frame: np.ndarray, tracking: TrackingResult) -> float:
         """Composite the scene + selection highlight (+ optional skeleton); return ms.
@@ -422,7 +507,21 @@ class PipelineRuntime:
             compositor.draw_selection_highlight(frame, self.scene)
             if self.show_skeleton:
                 _draw_debug(frame, list(tracking.hands), self._primary_gesture(tracking))
+            self._draw_active_stroke(frame)
         return timer.ms
+
+    def _draw_active_stroke(self, frame: np.ndarray) -> None:
+        """Overlay the in-progress stroke + fingertip cursor (after compositing).
+
+        Main-thread drawing on the private composited copy (allowed), so drawing
+        feels responsive before the stroke is frozen. A no-op when no stroke is
+        active.
+        """
+        if self._stroke is None or self._stroke.is_empty:
+            return
+        drawing.draw_live_stroke(
+            frame, self._stroke.points, self._stroke_color(), self._stroke_width
+        )
 
     def _update_fps(self) -> None:
         """Tick the FPS counter (loop rate) and print/remember a fresh reading."""
@@ -500,6 +599,7 @@ class PipelineRuntime:
             self.scene, self.interaction, self._fit_ids = _handle_layer_keys(
                 key, self._args, self.scene, self.interaction, self._fit_ids
             )
+            self._handle_drawing_key(key)
         return True
 
     # -- panel integration (Phase 10) -------------------------------------- #

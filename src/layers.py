@@ -22,9 +22,10 @@ keeps working; tests that monkeypatch the capture classes patch
 
 import argparse
 import sys
-from typing import Callable, Iterable, Optional, Set, Tuple
+from dataclasses import replace
+from typing import Callable, Iterable, List, Optional, Set, Tuple
 
-from src.interaction import InteractionState
+from src.interaction import GestureLike, InteractionState
 from src.scene import DEFAULT_SCALE, Layer, Scene
 from src.sources import (
     ImageSource,
@@ -305,3 +306,26 @@ def _initial_fit_ids(args: argparse.Namespace, scene: Scene) -> Set[int]:
     if args.mode != MODE_IMAGE or args.source not in LIVE_SOURCES:
         return set()
     return {layer.layer_id for layer in scene.layers}
+
+
+# --------------------------------------------------------------------------- #
+# Gesture precedence (Phase 11): while a hand is air-drawing, its curled-finger
+# pose must not also start a pinch-grab.
+# --------------------------------------------------------------------------- #
+
+def suppress_draw_pinch(gesture_states: List[GestureLike]) -> List[GestureLike]:
+    """Force ``is_pinching`` False for any hand currently drawing (``is_draw``).
+
+    Deterministic gesture precedence: a draw pose curls the middle/ring/pinky,
+    which can sit near the thumb and false-trigger a pinch rising edge. Feeding
+    the SUPPRESSED states into ``interaction.step`` means a drawing hand never
+    starts (or holds) a grab/resize, while non-drawing hands pass through
+    untouched. Returns a NEW list of new gesture states (``dataclasses.replace``
+    on the frozen ``GestureState``) -- the inputs are never mutated, and the
+    edge memory ``step`` derives from ``is_pinching`` stays coherent, so a real
+    pinch after drawing ends is still a clean rising edge. Pure + unit-testable.
+    """
+    return [
+        replace(state, is_pinching=False) if getattr(state, "is_draw", False) else state
+        for state in gesture_states
+    ]

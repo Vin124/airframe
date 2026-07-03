@@ -9,7 +9,7 @@ the rest of the pipeline never changes.
 
 from src.sources.base import Size, Source, SourceError
 from src.sources.capture import MonitorSource, WindowSource
-from src.sources.image import ImageSource
+from src.sources.image import ArraySource, ImageSource
 from src.sources.threaded import ThreadedSource
 from src.sources.webcam import WebcamSource
 
@@ -18,6 +18,7 @@ __all__ = [
     "Source",
     "SourceError",
     "ImageSource",
+    "ArraySource",
     "WebcamSource",
     "WindowSource",
     "MonitorSource",
