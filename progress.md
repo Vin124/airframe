@@ -141,3 +141,124 @@ them) → committed.
 - Hand slots can still swap between frames in two-hand tracking (chunk-1 note, unchanged).
 - Chunk 3 (per plan-2.md): packaging/installer, onboarding + gesture tuning UI, and the
   native-rewrite decision only if Python can't hold latency at target resolution.
+
+---
+
+# Chunk 3 — plan-3.md (Phases 11-16), built 2026-07-03
+
+The "speak-and-gesture AR presenter" layer: draw shapes in the air, and speak to pull
+real images (or generate imagined ones) into the call. Everything produced becomes a
+`Layer` in the existing scene and composites through to the virtual cam, reusing the
+Chunk-2 hand tracking + threaded pipeline. New optional deps land per phase; the base app
+still runs with none of them installed (all imported lazily).
+
+## How to run (chunk 3)
+
+```bash
+# same 3.11 venv. New OPTIONAL deps (install only what you use):
+#   speech:    pip install sounddevice faster-whisper useful-moonshine-onnx
+#   parser:    Ollama running locally + `ollama pull qwen2.5:1.5b` (no pip dep; stdlib urllib)
+#   retriever: pip install ddgs           (Wikimedia needs no dep; ddgs is the fallback)
+#   generator: pip install torch --index-url https://download.pytorch.org/whl/cu124
+#              pip install diffusers transformers accelerate safetensors   (CUDA GPU only)
+.venv\Scripts\python.exe -m src.main --mode image --image assets/test.png            # air-drawing (no deps)
+.venv\Scripts\python.exe -m src.main --mode image --image assets/test.png --speech   # + live transcript
+.venv\Scripts\python.exe -m src.main --mode image --image assets/test.png --speech --parse            # + LLM router
+.venv\Scripts\python.exe -m src.main --mode image --image assets/test.png --speech --parse --generate # + GPU generation
+```
+
+New runtime keys (image mode): air-drawing — hold the draw pose (index extended, other
+fingers curled) to trace a stroke; release to freeze it into a grabbable layer. `c` clear
+in-progress stroke, `k` cycle stroke color, `[`/`]` stroke width. Speak "insert CFTR" (with
+`--speech --parse`) to dock a fetched image at the top edge; pinch it and pull down to spawn
+it into the scene. `--speech`/`--parse`/`--generate` persist to `handy_config.json` like the
+other flags (CLI > config > default).
+
+## Phase-by-phase
+
+| Phase | Commit | Shipped | Tests |
+|-------|--------|---------|-------|
+| 11 — Air-drawing | `6d6e98d` | `drawing.py` (immutable Stroke + moving-average smoothing w/ pinned endpoints + rasterize-to-BGRA + bbox→Transform); draw-pose detection w/ N-frame hysteresis on the tracking thread; freeze-to-`ArraySource`-layer on release; `c`/`k`/`[`/`]` keys; pinch-suppressed-while-drawing precedence | 427 |
+| 12 — Speech layer | `bdbff31` | `speech.py` (`SpeechWorker` own thread owns mic + ASR; Moonshine active w/ faster-whisper fallback + engine warm-up validation; energy-VAD phrase segmentation; atomic rolling-transcript publish + per-phrase callback); `--speech`; heavy deps lazy/optional | 473 |
+| 13 — LLM parser + router | `ddafbdc` | `parser.py` (Ollama qwen2.5:1.5b → strict JSON `{action,query,route,source}`; `parse_llm_json` is the untrusted-output boundary — bounded input, JSON-bomb `RecursionError` caught, query clamped, enum-validated w/ safe defaults); `--parse`; runs on the speech thread | 524 |
+| 14 — Retriever | `749aa62` | `retriever.py` (WikimediaSource default + keyless DuckDuckGo `ddgs` fallback + optional local folder, behind one `fetch`; decode→BGRA asset; SSRF-safe: per-redirect-hop re-validation, http/https-only, 20 MB + 10 s caps, pre-decode 40 MP bomb guard, LRU temp cache) | 594 |
+| 15 — Spawn gesture | `3654b56` | `spawn.py` (`PreviewInbox` — the ONE atomic speech→main hand-off; pure dock geometry + `advance_spawn` state machine IDLE→GRABBED→spawn/dismiss; `render_dock`); retrieved image docks top-edge, pinch-from-top + pull-down spawns it as a layer through to the virtual cam; suppress-pinch-while-dragging precedence | 630 |
+| 16 — Generator (GPU) | `f4d5675` | `generator.py` (`DiffusionGenerator` — SDXL-Turbo default, **in-engine OOM fallback to sd-turbo**, lazy pipeline load, fp16 + cpu-offload for 8 GB; `make_placeholder` "materializing" card; RGB→BGRA); `--generate` opt-in; generate-routed request publishes placeholder→result via the same PreviewInbox spawn path; degrades to a notice with no GPU/torch | 667 |
+
+Every phase: implemented (opus subagent) → full pytest suite green → independent opus code
+review (all CRITICAL/HIGH fixed before commit; MEDIUMs fixed unless plan-deferred) →
+committed. Orchestrator fixes applied on top of each agent's work before commit (see Key
+decisions).
+
+## Verification performed
+
+- **Unit tests:** 667 passing (378 inherited from chunks 1-2, +289 for chunk 3), all
+  pure-logic/faked — no webcam, display, MediaPipe, mic, ASR model, Ollama, network, or GPU
+  touched. New coverage: stroke smoothing/rasterize/placement + draw-pose hysteresis +
+  pinch-suppression precedence; VAD segmentation + engine-fallback + SpeechWorker crash/mic-
+  fail lifecycle + bad-callback isolation; `parse_llm_json` on fenced/prose/garbage/bomb
+  input + routing normalization + OllamaClient error mapping; Wikimedia response parsing +
+  URL-scheme validation + decode/RGBA/downscale + decode-bomb + redirect-block + byte-cap +
+  cache prune + source fallback; PreviewInbox hand-off + dock geometry + spawn state machine
+  + mid-grab replacement + suppress-during-grab + runtime spawn lifecycle; generator
+  placeholder + RGB→BGRA + no-GPU/no-torch degrade + never-raises + **OOM fallback** +
+  placeholder-then-result publish order + `--generate` gating.
+- **Live/real-backend checks (this machine, throwaway scripts):**
+  - Phase 12: Moonshine engine initialized natively (faster-whisper `base.en` verified as
+    fallback + cached); 13 mic input devices probed (no recording).
+  - Phase 13: real Ollama round-trip hit the done-when first try — "yeah we're looking at
+    CFTR" → `{action: insert, query: "CFTR protein structure", route: retrieve, source:
+    wikimedia}`; chit-chat → `None`; "friendly robot mascot" → `route: generate`. Warm
+    latency ~2.8 s/call.
+  - Phase 14: real Wikimedia fetch for "CFTR protein structure" → 1024×715 BGRA, CC BY-SA
+    4.0 attribution, 0.62 s; nonsense query → graceful ddgs fallback.
+- **Phase 16 real GPU generation — NOT verified in this environment (disk-blocked).** torch
+  2.6.0+cu124 (CUDA available) and diffusers 0.39.0 install fine, but the ~7 GB diffusion
+  model can't be held: the disk has only ~8.6 GB free (925 GB drive, 100% full), and a
+  HuggingFace download needs ~2× the model size transiently to finalize, so both SDXL-Turbo
+  and sd-turbo downloaded to full size then failed to finalize and were cleaned up (GPU VRAM
+  never rose above idle → no model ever loaded). Separately, SDXL-Turbo was observed to OOM
+  the 8 GB card even with cpu-offload — which is exactly why the in-engine OOM→sd-turbo
+  fallback was added. The generator CODE is complete, reviewed (PASS, no CRITICAL/HIGH), and
+  fully unit-tested incl. the fallback; the runtime degrades cleanly (a load/OOM failure is
+  caught → one notice → generate returns `None`, app keeps running). **To finish verifying:
+  free ~15 GB of disk, then `--speech --parse --generate` and speak a "generate" request.**
+
+## Key decisions (chunk 3)
+
+- **One atomic channel per cross-thread hand-off, preserved throughout.** Speech runs on a
+  4th single-owner thread; the parser/retriever/generator all run ON that speech thread
+  (blocking network/GPU there is fine — never the render loop). The only speech→main channel
+  is `PreviewInbox` (one reference store/clear, latest-wins, no lock), so the main loop stays
+  the sole writer of scene/interaction. Every code review re-confirmed this invariant holds.
+- **Untrusted-input boundaries hardened at review time.** The LLM output (`parse_llm_json`)
+  and the remote-image fetch (`retriever`) are the two trust boundaries; reviews caught and
+  fixed a JSON-bomb `RecursionError` escaping the parser's "never raises" contract, and — on
+  the retriever — an SSRF-via-redirect scheme bypass and a decode-time pixel bomb, plus
+  bounded the query, download size, timeout, and temp cache.
+- **Degrade-never-die extended to every new dep.** Missing sounddevice/ASR, Ollama down,
+  Wikimedia/ddgs miss or error, no CUDA/torch, model OOM or load failure — each returns
+  `None` + one stderr notice and the app keeps running. All heavy imports are deferred so the
+  base pipeline imports with none installed (proven: the suite passes without torch).
+- **Model choice for the 8 GB target.** SDXL-Turbo (quality) is the default with an in-engine
+  OOM fallback to the lighter sd-turbo (reliability), rather than shipping a default that
+  silently fails on the stated hardware. qwen2.5:1.5b (over the installed qwen3:4b) for the
+  parser — smaller, faster, JSON-only, no thinking-mode overhead.
+- **main.py held at the 800-line cap** every phase by putting logic in the new modules and
+  trimming docstrings; spawn/generate glue lives in `spawn.py`/`generator.py`/`launch.py`.
+
+## Known limitations / follow-ups (chunk 3)
+
+- **Phase 16 real generation unverified (disk space)** — see Verification above. Also, the
+  first generate is slow on 8 GB (SDXL-Turbo load → OOM → sd-turbo reload) before it settles;
+  making sd-turbo the default on ≤8 GB cards would avoid the one-time OOM tax.
+- Speech transcription pauses while a generate request loads the model on the first call
+  (both on the speech thread); acceptable, bounded by the worker's daemon + join timeout.
+- The docked preview can be pinch-spawned while it's still a "materializing" placeholder
+  (spawns the placeholder card); the real image re-docks on arrival — acceptable MVP edge.
+- Stroke fragmentation on a tracking dropout and single-slot (primary-hand) drawing/spawn are
+  deliberate MVP tradeoffs (documented), owned by plan-3.md's closing tuning pass.
+- WebP images skip the pre-decode dimension probe (PNG/JPEG/GIF/BMP covered); a WebP bomb is
+  still bounded by the 20 MB compressed cap + post-decode backstop.
+- Deferred per plan-3.md: 3D objects (image-to-mesh), CLIP-embedding local library matching,
+  and the gesture-threshold/trigger-phrase tuning pass.
