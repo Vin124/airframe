@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.interaction import (
+    GRAB_RELEASE_GRACE_FRAMES,
     GrabState,
     InteractionState,
     ResizeState,
@@ -24,6 +25,20 @@ FRAME_SIZE = (100, 100)  # (width, height)
 def _gesture(is_pinching, pinch_point=(0.0, 0.0)):
     """A minimal stand-in for GestureState (only the fields step/grab read)."""
     return SimpleNamespace(is_pinching=is_pinching, pinch_point=pinch_point)
+
+
+def _release(i, scene, hand=None):
+    """Step enough not-pinching frames to outlast the grab release grace.
+
+    A grab is deliberately sticky (rides out brief tracking flickers), so a
+    single un-pinch frame no longer releases -- tests that want a clean release
+    step past ``GRAB_RELEASE_GRACE_FRAMES`` via this helper. ``hand`` overrides
+    the (both-idle) gesture pair, e.g. to simulate hand loss with a (0,0) point.
+    """
+    gestures = hand if hand is not None else [_gesture(False), _gesture(False)]
+    for _ in range(GRAB_RELEASE_GRACE_FRAMES + 1):
+        i, scene = step(i, scene, gestures, FRAME_SIZE)
+    return i, scene
 
 
 class _FakeSource(Source):
@@ -109,20 +124,30 @@ def test_move_follows_pinch_keeping_grab_offset():
     assert moved.center_y == pytest.approx(0.58)
 
 
-def test_unpinch_releases():
+def test_unpinch_within_grace_holds_then_releases():
     scene = _scene()
     i1, scene = step(_idle(), scene, [_gesture(True, (0.5, 0.5)), _gesture(False)], FRAME_SIZE)
+    # A single un-pinch frame is inside the grace window -> still grabbed (rides
+    # out a momentary pinch/tracking flicker instead of dropping the layer).
     i2, scene = step(i1, scene, [_gesture(False, (0.5, 0.5)), _gesture(False)], FRAME_SIZE)
-    assert i2.grab.is_grabbed is False
+    assert i2.grab.is_grabbed is True
+    # Sustained release past the grace window finally lets go.
+    i3, scene = _release(i2, scene)
+    assert i3.grab.is_grabbed is False
 
 
-def test_hand_loss_releases_without_moving_to_origin():
+def test_hand_loss_holds_in_grace_then_releases_without_moving_to_origin():
     scene = _scene()
     i1, scene = step(_idle(), scene, [_gesture(True, (0.5, 0.5)), _gesture(False)], FRAME_SIZE)
     # Hand loss is reported by the detector as not-pinching with a (0,0) point.
+    # During grace the layer FREEZES -- it must never snap toward the origin.
     i2, scene = step(i1, scene, [_gesture(False, (0.0, 0.0)), _gesture(False)], FRAME_SIZE)
-    assert i2.grab.is_grabbed is False
-    # Must NOT have snapped the image center to the origin.
+    assert i2.grab.is_grabbed is True
+    t = scene.selected_layer.transform
+    assert (t.center_x, t.center_y) == (0.5, 0.5)
+    # And once grace lapses it releases, still without having moved to origin.
+    i3, scene = _release(i2, scene, hand=[_gesture(False, (0.0, 0.0)), _gesture(False)])
+    assert i3.grab.is_grabbed is False
     t = scene.selected_layer.transform
     assert (t.center_x, t.center_y) == (0.5, 0.5)
 
@@ -277,8 +302,9 @@ def test_two_layers_are_independently_grabbable():
     i, scene = step(i, scene, [_gesture(True, (0.60, 0.5)), _gesture(False)], FRAME_SIZE)
     assert scene.layer_by_id(1).transform.center_x == pytest.approx(0.60)
     assert scene.layer_by_id(0).transform.center_x == pytest.approx(0.35)  # A untouched
-    # Release, then grab A (over its rect at x=0.35) and drag it to x=0.40.
-    i, scene = step(i, scene, [_gesture(False), _gesture(False)], FRAME_SIZE)
+    # Release (past the grace window so B truly lets go), then grab A (over its
+    # rect at x=0.35) and drag it to x=0.40.
+    i, scene = _release(i, scene)
     i, scene = step(i, scene, [_gesture(True, (0.35, 0.5)), _gesture(False)], FRAME_SIZE)
     assert scene.selected_layer.layer_id == 0
     i, scene = step(i, scene, [_gesture(True, (0.40, 0.5)), _gesture(False)], FRAME_SIZE)

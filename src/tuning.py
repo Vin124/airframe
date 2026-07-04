@@ -30,13 +30,16 @@ from dataclasses import dataclass
 PINCH_THRESHOLD_MIN = 0.10
 PINCH_THRESHOLD_MAX = 0.90
 
-# Built-in pinch defaults, tuned to match the old frame-fraction defaults'
-# arm's-length feel (0.05 absolute over a ~0.15-0.20 palm ~= 0.30 ratio; see the
-# HOW TO TUNE block in ``src.gestures``). ``src.gestures`` re-exports these as
-# the ``PINCH_ENTER_THRESHOLD`` / ``PINCH_EXIT_THRESHOLD`` names it has always
-# used.
-DEFAULT_PINCH_ENTER = 0.30
-DEFAULT_PINCH_EXIT = 0.45
+# Built-in pinch defaults (palm-relative ratio: thumb-index gap / palm length).
+# A firm pinch reads ~0.05-0.20 and an open hand well above 1.0, so ENTER at
+# 0.40 fires on a natural, LOOSE pinch (fingertips a few cm apart) rather than
+# demanding a hard press -- the earlier 0.30 needed near-touching fingers, which
+# is the main reason grabs felt hard to trigger. EXIT at 0.58 gives a wide 0.18
+# hysteresis band so a grab HOLDS while the fingers drift during a drag. Both are
+# live-tunable from the panel sliders. ``src.gestures`` re-exports these as
+# ``PINCH_ENTER_THRESHOLD`` / ``PINCH_EXIT_THRESHOLD``.
+DEFAULT_PINCH_ENTER = 0.40
+DEFAULT_PINCH_EXIT = 0.58
 
 # Minimum enter/exit separation. Hysteresis only works when exit sits strictly
 # ABOVE enter: entering a pinch needs the tight ENTER distance, but once pinching

@@ -8,6 +8,7 @@ the repo. Covers the round-trip, missing/corrupt fallbacks, and the
 import json
 
 from src import config
+from src.tuning import DEFAULT_PINCH_ENTER, DEFAULT_PINCH_EXIT
 
 
 def test_default_config_has_expected_keys_and_values():
@@ -21,8 +22,8 @@ def test_default_config_has_expected_keys_and_values():
         "speech": False,
         "parse": False,
         "generate": False,
-        "pinch_enter": 0.30,
-        "pinch_exit": 0.45,
+        "pinch_enter": DEFAULT_PINCH_ENTER,
+        "pinch_exit": DEFAULT_PINCH_EXIT,
         "min_detection_confidence": 0.5,
         "min_presence_confidence": 0.5,
         "min_tracking_confidence": 0.5,
@@ -164,23 +165,23 @@ def test_save_then_load_roundtrips(tmp_path):
 
 def test_merge_defaults_pinch_when_absent():
     merged = config.merge_config({"source": "image"})
-    assert merged["pinch_enter"] == 0.30
-    assert merged["pinch_exit"] == 0.45
+    assert merged["pinch_enter"] == DEFAULT_PINCH_ENTER
+    assert merged["pinch_exit"] == DEFAULT_PINCH_EXIT
 
 
 def test_merge_rejects_out_of_range_or_wrongtype_pinch():
     # Wrong type / out of range -> that key falls back to its default.
     merged = config.merge_config({"pinch_enter": "lots", "pinch_exit": 99.0})
-    assert merged["pinch_enter"] == 0.30
-    assert merged["pinch_exit"] == 0.45
+    assert merged["pinch_enter"] == DEFAULT_PINCH_ENTER
+    assert merged["pinch_exit"] == DEFAULT_PINCH_EXIT
 
 
 def test_merge_rejects_stale_frame_fraction_pinch_values():
     # Values persisted under the old frame-fraction metric (typically 0.01-0.09)
     # fall below the ratio metric's minimum and reset to the new defaults.
     merged = config.merge_config({"pinch_enter": 0.05, "pinch_exit": 0.07})
-    assert merged["pinch_enter"] == 0.30
-    assert merged["pinch_exit"] == 0.45
+    assert merged["pinch_enter"] == DEFAULT_PINCH_ENTER
+    assert merged["pinch_exit"] == DEFAULT_PINCH_EXIT
 
 
 def test_merge_enforces_hysteresis_gap_on_pinch_pair():
@@ -192,8 +193,8 @@ def test_merge_enforces_hysteresis_gap_on_pinch_pair():
 
 def test_merge_rejects_bool_pinch_values():
     merged = config.merge_config({"pinch_enter": True, "pinch_exit": False})
-    assert merged["pinch_enter"] == 0.30
-    assert merged["pinch_exit"] == 0.45
+    assert merged["pinch_enter"] == DEFAULT_PINCH_ENTER
+    assert merged["pinch_exit"] == DEFAULT_PINCH_EXIT
 
 
 def test_merge_validates_confidence_range():

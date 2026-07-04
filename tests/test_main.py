@@ -49,7 +49,13 @@ from src.scene import Layer, Scene, Transform
 from src.sinks import SinkError
 from src.sources import ImageSource, SourceError
 from src.sources.base import Size, Source
-from src.tuning import GestureTuning, TrackerConfidence, clamp_tuning
+from src.tuning import (
+    DEFAULT_PINCH_ENTER,
+    DEFAULT_PINCH_EXIT,
+    GestureTuning,
+    TrackerConfidence,
+    clamp_tuning,
+)
 
 
 class _FakeSource(Source):
@@ -1032,8 +1038,8 @@ def test_resolve_prefill_pinch_from_config_no_cli():
 def test_resolve_prefill_pinch_defaults_when_absent():
     args = parse_args(["--mode", "skeleton"])
     pf = resolve_panel_prefill(args, _FULL_CFG)  # no pinch keys
-    assert pf["pinch_enter"] == 0.30
-    assert pf["pinch_exit"] == 0.45
+    assert pf["pinch_enter"] == DEFAULT_PINCH_ENTER
+    assert pf["pinch_exit"] == DEFAULT_PINCH_EXIT
 
 
 def test_resolve_prefill_confidence_cli_nondefault_wins():

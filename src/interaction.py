@@ -25,9 +25,25 @@ from dataclasses import dataclass
 from math import hypot
 from typing import List, Optional, Protocol, Tuple
 
-from src.scene import DEFAULT_SCALE, Layer, Scene, Size, Transform, contains
+from src.scene import DEFAULT_SCALE, Layer, Scene, Size, Transform, contains, rect_px
 
 Point2D = Tuple[float, float]
+
+# Grab initiation is forgiving: a pinch that STARTS within this margin (as a
+# fraction of the smaller frame dimension) OUTSIDE the layer's rect still grabs
+# it. Aiming the fingertip-midpoint exactly onto a small overlay is fiddly, and
+# an exact hit-test made near-misses grab nothing while consuming the pinch
+# (you'd have to release and re-pinch). ~6% of a 720p frame is ~43 px of slack.
+GRAB_HIT_MARGIN_FRAC = 0.06
+
+# Release grace: once grabbed, this many consecutive not-pinching frames are
+# tolerated before the grab drops. MediaPipe pinch/tracking can flicker off for
+# a frame or two mid-drag (a brief hand-loss reports not-pinching), which used to
+# drop the layer instantly. During grace the layer is FROZEN in place; if the
+# pinch resumes the grab re-anchors to the current hand so it doesn't jump. At
+# ~30 fps this is ~0.13 s of forgiveness -- long enough to ride out a flicker,
+# short enough that a deliberate release still feels immediate.
+GRAB_RELEASE_GRACE_FRAMES = 4
 
 
 class GestureLike(Protocol):
@@ -54,11 +70,14 @@ class GrabState:
     ``offset`` is the normalized (center - pinch_point) captured at grab time so
     the layer tracks the hand without jump-centering. ``was_pinching`` is the
     previous frame's pinch flag, used to detect a pinch START (rising edge).
+    ``misses`` counts consecutive not-pinching frames while grabbed, driving the
+    release grace (see ``GRAB_RELEASE_GRACE_FRAMES``); it's 0 whenever pinching.
     """
 
     is_grabbed: bool = False
     offset: Point2D = (0.0, 0.0)
     was_pinching: bool = False
+    misses: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +107,34 @@ class InteractionState:
         return cls()
 
 
+def grab_hit(
+    transform: Transform,
+    base_size: Size,
+    point: Point2D,
+    frame_size: Size,
+    margin_frac: float = GRAB_HIT_MARGIN_FRAC,
+) -> bool:
+    """Forgiving hit-test for grab INITIATION: the layer rect grown by a margin.
+
+    Compositing/selection still use the exact ``contains`` rect; only starting a
+    grab gets this slack, so a near-miss pinch (fingertip-midpoint just off a
+    small overlay) still picks the layer up instead of grabbing nothing. The
+    margin is ``margin_frac`` of the smaller frame dimension, applied on every
+    side. A zero margin reduces exactly to ``contains``.
+    """
+    x0, y0, w, h = rect_px(transform, base_size, frame_size)
+    frame_w, frame_h = frame_size
+    margin = margin_frac * min(frame_w, frame_h)
+    px = point[0] * frame_w
+    py = point[1] * frame_h
+    return (x0 - margin) <= px < (x0 + w + margin) and (y0 - margin) <= py < (y0 + h + margin)
+
+
+def _anchor_offset(transform: Transform, pinch_point: Point2D) -> Point2D:
+    """The (center - pinch) offset so the layer tracks the hand without jumping."""
+    return (transform.center_x - pinch_point[0], transform.center_y - pinch_point[1])
+
+
 def update_grab(
     grab: GrabState,
     transform: Transform,
@@ -98,28 +145,44 @@ def update_grab(
 ) -> Tuple[GrabState, Transform]:
     """Advance the single-hand grab machine one frame.
 
-    IDLE -> GRABBED only on a pinch that STARTS over the layer (a pinch that
-    starts off-layer is consumed and never grabs, even if later dragged over).
-    While GRABBED the center follows the pinch point at the captured offset.
-    Un-pinch (which also covers hand loss, since a lost hand reports
-    not-pinching) releases back to IDLE. ``base_size`` is the layer's native
-    size, used for the hit-test; ``None`` (a source with no frame yet) means
-    the layer has no rect, so the pinch is consumed without grabbing.
+    IDLE -> GRABBED on a pinch that STARTS on (or within ``GRAB_HIT_MARGIN_FRAC``
+    of) the layer -- a pinch that starts clearly off-layer is consumed and never
+    grabs, even if later dragged over. While GRABBED the center follows the pinch
+    point at the captured offset. Releasing the pinch is tolerated for up to
+    ``GRAB_RELEASE_GRACE_FRAMES`` frames (a brief tracking flicker or hand-loss
+    reports not-pinching): during grace the layer FREEZES, and a resuming pinch
+    re-anchors to the current hand so it doesn't jump; only once grace is
+    exhausted does the grab drop. ``base_size`` ``None`` (a source with no frame
+    yet) means the layer has no rect, so the pinch is consumed without grabbing.
     """
     if grab.is_grabbed:
-        if not is_pinching:
-            return GrabState(is_grabbed=False, offset=(0.0, 0.0), was_pinching=False), transform
-        new_center = (pinch_point[0] + grab.offset[0], pinch_point[1] + grab.offset[1])
-        moved = transform.moved_to(*new_center)
-        return GrabState(is_grabbed=True, offset=grab.offset, was_pinching=True), moved
+        if is_pinching:
+            # Resuming after a flicker (misses>0): re-anchor so the layer doesn't
+            # snap by the distance the hand moved while the pinch was dropped.
+            offset = _anchor_offset(transform, pinch_point) if grab.misses else grab.offset
+            new_center = (pinch_point[0] + offset[0], pinch_point[1] + offset[1])
+            return (
+                GrabState(is_grabbed=True, offset=offset, was_pinching=True, misses=0),
+                transform.moved_to(*new_center),
+            )
+        if grab.misses < GRAB_RELEASE_GRACE_FRAMES:
+            # Hold position through a brief drop; wait for the pinch to resume.
+            return (
+                GrabState(
+                    is_grabbed=True, offset=grab.offset, was_pinching=False,
+                    misses=grab.misses + 1,
+                ),
+                transform,
+            )
+        return GrabState(is_grabbed=False, offset=(0.0, 0.0), was_pinching=False), transform
 
     pinch_started = is_pinching and not grab.was_pinching
     if (
         pinch_started
         and base_size is not None
-        and contains(transform, base_size, pinch_point, frame_size)
+        and grab_hit(transform, base_size, pinch_point, frame_size)
     ):
-        offset = (transform.center_x - pinch_point[0], transform.center_y - pinch_point[1])
+        offset = _anchor_offset(transform, pinch_point)
         return GrabState(is_grabbed=True, offset=offset, was_pinching=True), transform
     return GrabState(is_grabbed=False, offset=grab.offset, was_pinching=is_pinching), transform
 

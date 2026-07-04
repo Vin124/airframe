@@ -124,6 +124,11 @@ TARGET_FPS = 30
 # pinch-resize).
 IMAGE_MODE_NUM_HANDS = 2
 
+# Number of hands to track in skeleton mode. Two so both hands draw and the
+# tracking thread's slot matcher / smoother / detectors size to two -- there's
+# no interaction here, it's purely the debug skeleton overlay.
+SKELETON_MODE_NUM_HANDS = 2
+
 
 # Keyboard scaling in image mode. '+' usually needs shift, so accept its
 # unshifted twin '='; likewise '-' and '_'. One key press multiplies the scale
@@ -240,9 +245,14 @@ def _init_mode(
     confidence = confidence if confidence is not None else TrackerConfidence()
     try:
         if args.mode == MODE_SKELETON:
-            tracker = HandTracker(gpu=args.gpu, confidence=confidence)
-            detector = GestureDetector(tuning.enter, tuning.exit)
-            return tracker, [detector], Scene(), None
+            tracker = HandTracker(
+                num_hands=SKELETON_MODE_NUM_HANDS, gpu=args.gpu, confidence=confidence
+            )
+            detectors = [
+                GestureDetector(tuning.enter, tuning.exit)
+                for _ in range(SKELETON_MODE_NUM_HANDS)
+            ]
+            return tracker, detectors, Scene(), None
 
         tracker = HandTracker(
             num_hands=IMAGE_MODE_NUM_HANDS, gpu=args.gpu, confidence=confidence
