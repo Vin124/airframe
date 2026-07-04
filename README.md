@@ -7,7 +7,13 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+" /></a>
   <a href="#requirements"><img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4.svg" alt="Platform: Windows" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
+  <a href="#status"><img src="https://img.shields.io/badge/status-WIP-orange.svg" alt="Status: Work in progress" /></a>
 </p>
+
+> ⚠️ **Work in progress.** This is an experimental debug harness, not a finished
+> product. Core pieces work, but gesture detection (especially pinch-to-grab)
+> is still being tuned and **may not work reliably yet** depending on your
+> camera, lighting, and hand distance. Expect rough edges. See [Status](#status).
 
 **Control your screen with your hands.** A real-time, gesture-driven overlay
 studio for Windows: grab images, live windows, or your whole monitor with a
@@ -205,6 +211,20 @@ Architecture notes for AI-assisted development live in [`CLAUDE.md`](CLAUDE.md).
 | `[parser]` notices with `--parse` | Start Ollama (`ollama serve`) and pull a small model |
 | First `--generate` is very slow | One-time model download + load; subsequent generates are seconds |
 | Pinch feels too eager / too stiff | Drag the panel's ENTER slider down / up |
+
+## Status
+
+**Work in progress — expect this to be rough.** It's a personal debug harness
+for exploring webcam hand-tracking, not a polished app.
+
+- **Known issue:** pinch-to-grab can be unreliable. Detection depends heavily on
+  lighting, camera quality, and how far your hand is from the lens. It's being
+  actively tuned (looser thresholds, a forgiving grab margin, and a release
+  grace that rides out brief tracking dropouts) but **may still not work well
+  for you.**
+- If grabbing misbehaves, open the control panel and adjust the **pinch ENTER /
+  EXIT** sliders live; settings persist to `handy_config.json`.
+- Feedback and issues are welcome while this is being figured out.
 
 ## Development
 
