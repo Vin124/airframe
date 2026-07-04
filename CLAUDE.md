@@ -2,7 +2,7 @@
 
 Windows webcam hand-tracking MVP (Shacam-style). Debug harness, not the production app. Python + OpenCV + MediaPipe.
 
-Full context in `@spec.md`. Phased build with per-phase prompts in `@plan.md`.
+Full context in `@docs/spec.md`. Phased build with per-phase prompts in `@docs/plan.md` (chunk 2: `docs/plan-2.md`, chunk 3: `docs/plan-3.md`; build log: `docs/progress.md`).
 
 ## Commands
 ```bash
@@ -130,7 +130,7 @@ hand-off, GIL-safe, latest-frame-wins):
 ## Conventions
 - Every phase in `plan.md` must leave the app runnable — no half-wired states.
 - Pass landmarks as normalized coords (0-1); convert to pixels only at draw time.
-- Landmark indices: thumb tip = 4, index tip = 8. Pinch = normalized distance(4,8) under a threshold defined as a constant in `gestures.py`.
+- Landmark indices: thumb tip = 4, index tip = 8, middle MCP = 9. Pinch = distance(4,8) DIVIDED by the palm length distance(0,9), under a threshold defined as a constant in `gestures.py` (via `src/tuning.py`). The palm-relative ratio is scale-invariant: one tuned threshold behaves the same near and far from the camera.
 - Mirror the webcam frame horizontally (selfie view).
 - Print FPS to console so we can see if tracking keeps up (FPS = main-loop rate).
 - Threading (Phase 9): one owner per piece of state, hand off with a single
@@ -140,13 +140,37 @@ hand-off, GIL-safe, latest-frame-wins):
 
 ## Gotchas
 - Prefer MediaPipe Tasks API (`HandLandmarker`, `hand_landmarker.task`) in VIDEO/LIVE_STREAM mode; fall back to legacy `mp.solutions.hands` only if the installed version makes that simpler.
+- The webcam opens at its NATIVE (maximum) resolution: `Camera.open` requests an
+  absurdly large mode (10000x10000) and the driver clamps to its largest
+  supported one (1920x1080@30 on the dev machine), printing the negotiated size
+  once. The request MUST happen at open, BEFORE the first read — the MSMF
+  backend crashes on a mid-stream mode change (observed, OpenCV 5.0/Win11).
+  Downstream is size-agnostic, with two deliberate caps: `HandTracker.detect`
+  downscales its input to `DETECTION_MAX_HEIGHT` (480, aspect kept) so per-detect
+  cost/accuracy stay as tuned regardless of capture size (landmarks are
+  normalized, so nothing else changes), and `PreviewSink` opens its window
+  resizable, initially scaled to fit 1280x720 so a 1080p frame doesn't overflow
+  the screen (the frame itself — and the virtual cam — stay full resolution).
 - Pinch thresholds are LIVE-tunable via the panel sliders: a slider publishes a
   frozen `GestureTuning` from the main thread to the tracking thread (one atomic
   ref store, `TrackingWorker.set_tuning`), which swaps it onto the detectors it
   owns — the main thread never touches detector internals. `clamp_tuning` (in
   `src/tuning.py`) is the ONE boundary enforcing `exit > enter` (a minimum gap),
   used by BOTH the slider path and config load, so an inverted/equal pair can
-  never reintroduce pinch-label flicker.
+  never reintroduce pinch-label flicker. The thresholds are palm-relative
+  RATIOS (thumb-index distance / wrist-to-middle-MCP palm length, range
+  0.10-0.90, defaults 0.30/0.45), NOT fractions of the frame — the old
+  frame-fraction values (0.01-0.15) persisted in a stale `handy_config.json`
+  fall below the ratio range and auto-reset to the defaults on load.
+- Hand-slot stability: MediaPipe returns hands in no guaranteed order, so with
+  two hands in frame a hand could swap detector slots mid-gesture (taking the
+  other hand's pinch latch + smoother bank with it). `HandSlotMatcher` (in
+  `src/tracking.py`, owned by the tracking thread like the smoother) reorders
+  each two-hand detection to minimize total wrist travel from the previous
+  frame's per-slot wrists, so hysteresis and One-Euro state stay attached to
+  the same physical hand. Zero/one-hand frames pass through unchanged; a
+  slot's last wrist is kept while empty so a briefly-lost hand re-lands in its
+  old slot.
 - The three MediaPipe min-confidence params (`--min-detection-confidence`,
   `--min-presence-confidence`, `--min-tracking-confidence`) are STARTUP-ONLY:
   they bake into the `HandLandmarker` options, so changing them needs a tracker

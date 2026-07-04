@@ -1,7 +1,18 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
-*.task
 .coverage
+
+# Downloaded models (fetched automatically on first run)
+models/
+*.task
+*.task.part
+
+# Per-user local state
 handy_config.json
+
+# Editors
+.vscode/
+.idea/
