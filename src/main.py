@@ -91,7 +91,6 @@ from src.layers import (  # noqa: F401  (re-exported for tests / used below)
     _monitor_source_from_index,
     _remove_selected_layer,
     _window_source_from_title,
-    fist_removal_target,
 )
 from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     _build_panel,
@@ -107,6 +106,7 @@ from src.spawn import (  # noqa: F401  (Phase 15 spawn gesture; re-exported for 
     PreviewInbox, PreviewState, advance_spawn, dock_preview, render_dock,
     suppress_spawn_pinch,
 )
+from src.trash import draw_trash_zone, in_trash_zone
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
     from src.panel import ControlPanel
@@ -124,9 +124,6 @@ TARGET_FPS = 30
 # pinch-resize).
 IMAGE_MODE_NUM_HANDS = 2
 
-# Consecutive main-loop ticks a fist must be held over a layer before it's
-# removed (~0.4 s at TARGET_FPS) -- a deliberate hold, not a momentary fist.
-FIST_REMOVE_FRAMES = 12
 
 # Keyboard scaling in image mode. '+' usually needs shift, so accept its
 # unshifted twin '='; likewise '-' and '_'. One key press multiplies the scale
@@ -326,9 +323,9 @@ class PipelineRuntime:
         # (drawing.DrawState). In draw mode a pinch inks; toggling off freezes it.
         self._draw = drawing.DrawState()
         self._draw_was_pinching = False  # pinch edge for pen up/down
-        # Fist-to-remove hold: the layer index a fist is over + its held-frames.
-        self._fist_index: Optional[int] = None
-        self._fist_streak = 0
+        # Trash-corner remove: a grab released inside the trash zone deletes it.
+        self._was_grabbing = False
+        self._last_grab_point: Optional[Tuple[float, float]] = None
         self._frame_size: Tuple[int, int] = (0, 0)  # last frame size (freeze on 'd')
 
     def run(self) -> None:
@@ -409,7 +406,7 @@ class PipelineRuntime:
         self.interaction, self.scene = step(
             self.interaction, self.scene, gestures, frame_size
         )
-        self._advance_fist_removal(gesture_states, frame_size)
+        self._advance_trash_removal(gesture_states, frame_size)
         self._status = hud.resize_or_grab_status(
             self.interaction.grab.is_grabbed, self.interaction.resize.is_resizing
         )
@@ -440,24 +437,24 @@ class PipelineRuntime:
         if self.interaction is not None:
             self.interaction = InteractionState.initial()
 
-    def _advance_fist_removal(self, gesture_states: list, frame_size: Tuple[int, int]) -> None:
-        """Remove a layer after a fist is held over it for ``FIST_REMOVE_FRAMES`` ticks.
+    def _advance_trash_removal(self, gesture_states: list, frame_size: Tuple[int, int]) -> None:
+        """Remove the grabbed layer when a grab is RELEASED inside the trash zone.
 
-        A hold counter debounces a momentary fist; at the threshold the target is
-        selected + removed via the 'x' key's source-closing path.
+        Tracks the active grab's pinch each frame; on release inside the
+        bottom-right zone the selected layer is removed via the 'x' key's
+        source-closing path. Only pinch-grab -- no flaky pose to mis-detect.
         """
-        target = fist_removal_target(self.scene, gesture_states, frame_size)
-        if target is None:
-            self._fist_index, self._fist_streak = None, 0
-            return
-        self._fist_streak = self._fist_streak + 1 if target == self._fist_index else 1
-        self._fist_index = target
-        if self._fist_streak >= FIST_REMOVE_FRAMES:
-            self.scene = self.scene.select_layer(target)
-            self.scene, self.interaction, self._fit_ids = _remove_selected_layer(
-                self.scene, self.interaction, self._fit_ids
-            )
-            self._fist_index, self._fist_streak = None, 0
+        grabbing = self.interaction.grab.is_grabbed
+        active = next((g for g in gesture_states if g.is_pinching), None)
+        if grabbing and active is not None:
+            self._last_grab_point = active.pinch_point
+        elif self._was_grabbing and self._last_grab_point is not None:
+            if in_trash_zone(self._last_grab_point, frame_size):
+                self.scene, self.interaction, self._fit_ids = _remove_selected_layer(
+                    self.scene, self.interaction, self._fit_ids
+                )
+            self._last_grab_point = None
+        self._was_grabbing = grabbing
 
     def _advance_spawn(self, gesture_states: list, frame_size: Tuple[int, int]) -> bool:
         """Drain the preview inbox, advance the spawn machine, apply any spawn.
@@ -522,6 +519,10 @@ class PipelineRuntime:
                 _draw_debug(frame, list(tracking.hands), self._primary_gesture(tracking))
             if self._draw.mode:
                 drawing.draw_live_state(frame, self._draw)  # live ink -> preview + vcam
+            elif self.scene.layers:  # trash corner (armed when a grab hovers inside)
+                armed = self.interaction.grab.is_grabbed and self._last_grab_point is not None \
+                    and in_trash_zone(self._last_grab_point, self._frame_size)
+                draw_trash_zone(frame, armed)
             render_dock(frame, self._preview_state)  # docked preview -> preview + vcam
         return timer.ms
 

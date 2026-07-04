@@ -69,6 +69,24 @@ def test_pinch_start_on_image_grabs():
     assert interaction.grab.is_grabbed is True
 
 
+def test_secondary_hand_can_grab():
+    # Either hand grabs: with ONLY slot 1 pinching over the layer, it grabs -- the
+    # fix for "only the primary (yellow-dot) hand moves things".
+    interaction, _scene_out = step(
+        _idle(), _scene(), [_gesture(False), _gesture(True, (0.5, 0.5))], FRAME_SIZE
+    )
+    assert interaction.grab.is_grabbed is True
+
+
+def test_secondary_hand_grab_moves_the_layer():
+    scene = _scene(_layer(transform=Transform(0.5, 0.5)))
+    # Grab with slot 1, then move it; the layer should follow slot 1's pinch.
+    interaction, scene = step(_idle(), scene, [_gesture(False), _gesture(True, (0.5, 0.5))], FRAME_SIZE)
+    interaction, scene = step(interaction, scene, [_gesture(False), _gesture(True, (0.7, 0.6))], FRAME_SIZE)
+    layer = scene.selected_layer
+    assert layer.transform.center_x > 0.5  # moved toward slot 1's new position
+
+
 def test_pinch_start_off_image_does_not_grab_even_when_dragged_over():
     scene = _scene()
     # Pinch starts off the image.

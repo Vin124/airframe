@@ -51,6 +51,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from src.gestures import GestureDetector, GestureState
+from src.smoothing import LandmarkSmoother
 from src.hand_tracker import Hand, HandTracker
 from src.timing import StageTimer
 from src.tuning import GestureTuning
@@ -109,15 +110,23 @@ def detect_and_update(
     tracker: HandTracker,
     detectors: List[GestureDetector],
     frame,
+    smoother: Optional["LandmarkSmoother"] = None,
+    t: float = 0.0,
 ) -> Tuple[Tuple[Hand, ...], Tuple[GestureState, ...]]:
-    """Detect hands and feed hand slot ``i`` to ``detectors[i]`` (pure of threads).
+    """Detect hands, de-jitter them, and feed hand slot ``i`` to ``detectors[i]``.
 
     Returns ``(hands, gesture_states)`` with one gesture state per detector (slot
-    0 = primary hand). NOTE: MediaPipe may swap hand order between frames, so a
-    hand can jump detector slots; that's accepted MVP jitter (see CLAUDE.md). Kept
-    a free function so it's testable with a fake tracker and fake detectors.
+    0 = primary hand). When a ``smoother`` is given the raw landmarks are One-Euro
+    smoothed at time ``t`` BEFORE gesture detection, so pinch/grab read a steadier
+    hand (and the published hands the skeleton draws are smoothed too). NOTE:
+    MediaPipe may swap hand order between frames, so a hand can jump detector
+    slots; that's accepted MVP jitter (see CLAUDE.md). Kept a free function so it's
+    testable with a fake tracker and fake detectors.
     """
-    hands = tuple(tracker.detect(frame))
+    hands = list(tracker.detect(frame))
+    if smoother is not None:
+        hands = smoother.smooth(hands, t)
+    hands = tuple(hands)
     gesture_states = tuple(
         detector.update(hands[i] if i < len(hands) else None)
         for i, detector in enumerate(detectors)
@@ -145,6 +154,9 @@ class TrackingWorker:
         self._detectors = detectors
         self._frame_provider = frame_provider
         self._clock = clock
+        # One-Euro landmark smoother (de-jitters MediaPipe output before gesture
+        # detection); owned solely by this thread, one filter bank per hand slot.
+        self._smoother = LandmarkSmoother(len(detectors))
         self._result = initial_result(len(detectors))
         self._last_seq = 0
         # Live pinch tuning: the main thread publishes a new GestureTuning here
@@ -210,9 +222,10 @@ class TrackingWorker:
         if packet is None or packet[0] == self._last_seq:
             return False
         seq, frame = packet
+        now = self._clock()  # smoothing timestamp, read outside the timed region
         with StageTimer(self._clock) as timer:
             hands, gesture_states = detect_and_update(
-                self._tracker, self._detectors, frame
+                self._tracker, self._detectors, frame, self._smoother, now
             )
         self._last_seq = seq
         self._result = TrackingResult(  # single atomic publish

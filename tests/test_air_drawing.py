@@ -20,12 +20,10 @@ from src.drawing import (
 )
 from src.gestures import GestureState
 from src.interaction import GrabState, InteractionState
-from src.layers import fist_removal_target
 from src.main import (
     CLEAR_STROKE_KEY,
     CYCLE_COLOR_KEY,
     DRAW_MODE_KEY,
-    FIST_REMOVE_FRAMES,
     STROKE_WIDTH_DOWN_KEY,
     STROKE_WIDTH_UP_KEY,
     PipelineRuntime,
@@ -34,6 +32,7 @@ from src.main import (
 from src.scene import Layer, Scene, Transform
 from src.sources import ArraySource
 from src.sources.base import Size, Source
+from src.trash import in_trash_zone
 
 FRAME_SIZE = (100, 100)
 
@@ -88,10 +87,6 @@ def _pinch(point) -> GestureState:
 
 def _idle() -> GestureState:
     return GestureState(is_pinching=False, pinch_point=(0.0, 0.0), is_grab=False)
-
-
-def _fist(point) -> GestureState:
-    return GestureState(is_pinching=False, pinch_point=(0.0, 0.0), is_grab=True, grab_point=point)
 
 
 def _advance(rt, gesture_states) -> None:
@@ -244,44 +239,39 @@ def test_pinch_grabs_layer_when_not_drawing():
 
 
 # --------------------------------------------------------------------------- #
-# Fist-to-remove gesture
+# Trash-corner remove: grab a layer, drag into the bottom-right zone, release
 # --------------------------------------------------------------------------- #
 
-def test_fist_removal_target_hits_layer_under_fist():
-    scene = _layer_scene()
-    assert fist_removal_target(scene, [_fist((0.5, 0.5))], FRAME_SIZE) == 0
-    assert fist_removal_target(scene, [_fist((0.05, 0.05))], FRAME_SIZE) is None  # off the layer
+_TRASH_POINT = (0.97, 0.97)   # deep in the bottom-right trash zone
+_SAFE_POINT = (0.5, 0.5)      # center, well outside the trash zone
 
 
-def test_fist_removal_target_ignores_a_pinching_hand():
-    # A pinch-grab-move (fingers may curl) must not read as a remove fist.
-    scene = _layer_scene()
-    pinch_and_grab = GestureState(
-        is_pinching=True, pinch_point=(0.5, 0.5), is_grab=True, grab_point=(0.5, 0.5)
-    )
-    assert fist_removal_target(scene, [pinch_and_grab], FRAME_SIZE) is None
+def test_in_trash_zone_geometry():
+    assert in_trash_zone(_TRASH_POINT, FRAME_SIZE) is True
+    assert in_trash_zone(_SAFE_POINT, FRAME_SIZE) is False
 
 
-def test_held_fist_removes_the_layer_after_threshold():
+def test_grab_released_in_trash_zone_removes_layer():
     rt = _image_runtime(scene=_layer_scene())
-    for _ in range(FIST_REMOVE_FRAMES - 1):
-        _advance(rt, [_fist((0.5, 0.5))])
-    assert len(rt.scene.layers) == 1  # not yet -- still counting the hold
-    _advance(rt, [_fist((0.5, 0.5))])  # crosses the threshold
-    assert len(rt.scene.layers) == 0  # removed
+    # Grab the layer (pinch over it), drag toward the trash corner, then release.
+    _advance(rt, [_pinch(_SAFE_POINT)])   # rising edge -> grabbed
+    assert rt.interaction.grab.is_grabbed is True
+    _advance(rt, [_pinch(_TRASH_POINT)])  # dragged into the trash zone (still held)
+    _advance(rt, [_idle()])               # release inside the zone -> remove
+    assert len(rt.scene.layers) == 0
 
 
-def test_momentary_fist_does_not_remove():
+def test_grab_released_outside_trash_zone_keeps_layer():
     rt = _image_runtime(scene=_layer_scene())
-    _advance(rt, [_fist((0.5, 0.5))])   # one frame
-    _advance(rt, [_idle()])             # fist lifted -> counter resets
-    for _ in range(FIST_REMOVE_FRAMES - 1):
-        _advance(rt, [_fist((0.5, 0.5))])
-    assert len(rt.scene.layers) == 1  # the reset means the threshold isn't reached
-
-
-def test_fist_over_empty_space_removes_nothing():
-    rt = _image_runtime(scene=_layer_scene())
-    for _ in range(FIST_REMOVE_FRAMES + 2):
-        _advance(rt, [_fist((0.02, 0.02))])  # nowhere near the layer
+    _advance(rt, [_pinch(_SAFE_POINT)])   # grabbed
+    _advance(rt, [_pinch((0.55, 0.55))])  # moved, but not into the trash zone
+    _advance(rt, [_idle()])               # released outside -> keep
     assert len(rt.scene.layers) == 1
+
+
+def test_hovering_trash_zone_without_release_keeps_layer():
+    rt = _image_runtime(scene=_layer_scene())
+    _advance(rt, [_pinch(_SAFE_POINT)])
+    for _ in range(5):
+        _advance(rt, [_pinch(_TRASH_POINT)])  # held over the zone, never released
+    assert len(rt.scene.layers) == 1  # nothing removed until the pinch releases

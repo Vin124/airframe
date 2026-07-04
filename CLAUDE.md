@@ -42,9 +42,11 @@ same way; only meaningful when `speech` is also on), `generate` (Phase 16 opt-in
 Runtime keys: `q` quit, `s` toggle skeleton (ON by default in image mode for
 dev), `r` reset transform, `+/-` scale, `v` toggle virtual cam. Image-mode
 multi-layer: `a`/`w`/`m` add an image / window / screen layer (reusing the launch
-args), `x` remove the selected layer, `f` bring it to the front. A pinch grabs
-the top-most layer under the pinch point; the selected layer is outlined. A
-closed FIST held over a layer for ~0.4s removes it (gesture equivalent of `x`).
+args), `x` remove the selected layer, `f` bring it to the front. A pinch from
+EITHER hand grabs the top-most layer under the pinch point (two pinching hands
+resize); the selected layer is outlined. To remove by gesture, pinch-grab a layer
+and drag it into the bottom-right TRASH corner, then release (the zone arms while
+a grabbed pinch hovers inside).
 Image-mode air-drawing uses a DRAW MODE (not a held pose): `d` toggles draw mode;
 in it a PINCH is the pen (draws the pinch path while pinching, lifts on release,
 so multiple strokes accumulate), and toggling draw mode off (`d` again) freezes
@@ -75,7 +77,9 @@ src/generator.py       # Image generator (Phase 16, OPTIONAL/GPU, reached via --
 src/spawn.py           # Spawn gesture (Phase 15): PreviewInbox (the ONE speech->main atomic hand-off slot) + pure dock geometry (dock_rect/pinch_over_dock/pull_down_distance/spawn_transform) + the advance_spawn state machine (frozen PreviewState: IDLE docked -> GRABBED -> spawn/dismiss) + suppress_spawn_pinch precedence + render_dock (draws the docked preview onto the composited frame). Pure numpy/cv2 except PreviewInbox; no camera/mediapipe/threads. The main loop is the sole scene writer
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
-src/gestures.py       # pinch/grab detection from landmarks; per-instance enter/exit thresholds (live-tunable); publishes pinch_point + palm-center grab_point
+src/gestures.py       # pinch/grab detection from landmarks; per-instance enter/exit thresholds (live-tunable)
+src/smoothing.py      # One-Euro landmark smoother (de-jitters MediaPipe output before gesture detection); owned by the tracking thread
+src/trash.py          # trash-corner remove: zone geometry (in_trash_zone) + draw_trash_zone; pure geometry + one cv2 draw
 src/drawing.py        # air-drawing: DrawState (draw mode + pinch strokes) + smoothing + rasterize-to-BGRA + bbox->Transform placement + live overlay; pure numpy/cv2
 src/tuning.py         # dependency-light GestureTuning + TrackerConfidence snapshots + clamp_tuning (the one hysteresis-gap boundary, shared by panel + config)
 src/window_list.py    # list_window_titles(): open top-level window titles via ctypes EnumWindows (panel dropdown); injectable + failure-safe ([])
@@ -255,11 +259,21 @@ hand-off, GIL-safe, latest-frame-wins):
   layer placed via `bbox_to_transform`. The main loop NEVER computes a gesture
   from raw landmarks -- it reads only the published pinch. Keys d/c/k/[/] are
   image-mode only.
-- Fist-to-remove (image mode): `GestureDetector` publishes `is_grab` (fist) + the
-  palm-center `grab_point` (landmark 9). `layers.fist_removal_target` resolves the
-  top layer under a FISTING, NON-pinching hand (so a pinch-grab-move is never
-  mistaken for a fist); the main loop debounces a `FIST_REMOVE_FRAMES` hold, then
-  selects + removes that layer via the same source-closing path as the `x` key.
+- Either hand grabs (image mode): `interaction.grab_hands` picks the ACTIVE hand
+  as whichever is pinching (either slot), so a single-hand grab/move works no
+  matter which hand MediaPipe put in slot 0 (fixes "only the yellow-dot hand
+  moves"); two pinching hands still resize.
+- Trash-corner remove (image mode) replaced the flaky fist gesture (MediaPipe's
+  fist detection flickered, so the hold never landed). Pinch-grab a layer, drag it
+  into the bottom-right zone (`src/trash.py` `in_trash_zone`), and RELEASE inside
+  it: the main loop tracks the active grab's pinch and, on release in the zone,
+  removes the layer via the `x` key's source-closing path. Reuses only the
+  reliable pinch-grab -- nothing new to mis-detect.
+- Landmark smoothing: the tracking thread runs raw MediaPipe landmarks through a
+  One-Euro filter (`src/smoothing.py`, `LandmarkSmoother`, one bank per hand slot)
+  BEFORE gesture detection, so pinch/grab read a steadier hand and the skeleton
+  draws smoothed points. Adaptive (heavy smoothing at rest, light when moving fast
+  -- de-jitter without drag lag); retune `DEFAULT_MIN_CUTOFF` / `DEFAULT_BETA`.
 - Multiple overlay layers are supported at runtime (Phase 8): add/remove layers,
   pinch to grab whichever is under the pinch point, bring-to-front, all live.
   Selection is single (exactly one active layer); layers carry a stable

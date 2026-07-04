@@ -22,8 +22,7 @@ keeps working; tests that monkeypatch the capture classes patch
 
 import argparse
 import sys
-from dataclasses import replace
-from typing import Callable, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Iterable, Optional, Set, Tuple
 
 from src.interaction import InteractionState
 from src.scene import DEFAULT_SCALE, Layer, Scene
@@ -308,26 +307,3 @@ def _initial_fit_ids(args: argparse.Namespace, scene: Scene) -> Set[int]:
     return {layer.layer_id for layer in scene.layers}
 
 
-# --------------------------------------------------------------------------- #
-# Fist-to-remove gesture: a closed fist held over a layer removes it. The hold
-# timer lives in the main loop; this just resolves which layer is under a fist.
-# --------------------------------------------------------------------------- #
-
-def fist_removal_target(
-    scene: Scene, gesture_states: Iterable, frame_size: Tuple[int, int]
-) -> Optional[int]:
-    """Top-most layer index under a hand making a fist (not pinching), or ``None``.
-
-    The fist-to-remove gesture: a hand closed into a fist (``is_grab``) but NOT
-    pinching -- so a pinch-grab-move (fingers may curl during it) is never
-    mistaken for a fist -- hovering over a layer marks it for removal. Returns
-    the top layer index under the first such hand's palm point (``grab_point``),
-    or ``None`` when no hand is fisting over a layer. Pure: the caller times the
-    hold and performs the removal.
-    """
-    for state in gesture_states:
-        if getattr(state, "is_grab", False) and not state.is_pinching:
-            index = scene.top_layer_at(state.grab_point, frame_size)
-            if index is not None:
-                return index
-    return None

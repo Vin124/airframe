@@ -11,7 +11,6 @@ from src.gestures import (
     pinch_distance_and_midpoint,
 )
 
-MIDDLE_MCP = 9
 
 WRIST = 0
 THUMB_TIP = 4
@@ -248,19 +247,3 @@ def test_detector_resets_pinch_state_after_hand_lost():
     drifted_hand[INDEX_TIP] = (0.5, 0.5 + mid_distance, 0.0)
 
     assert detector.update(drifted_hand).is_pinching is False
-
-
-# --------------------------------------------------------------------------- #
-# Palm-center grab_point (for the fist-to-remove gesture)
-# --------------------------------------------------------------------------- #
-
-def test_detector_publishes_palm_center_as_grab_point():
-    detector = GestureDetector()
-    hand = _open_hand()
-    hand[MIDDLE_MCP] = (0.42, 0.55, 0.0)  # palm center (middle-finger MCP)
-    state = detector.update(hand)
-    assert state.grab_point == pytest.approx((0.42, 0.55))
-
-
-def test_detector_no_hand_grab_point_is_origin():
-    assert GestureDetector().update(None).grab_point == (0.0, 0.0)

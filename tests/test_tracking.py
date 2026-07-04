@@ -133,7 +133,9 @@ def test_poll_once_skips_already_processed_sequence():
 
 
 def test_poll_once_records_track_ms():
-    ticks = iter([10.0, 10.02, 99.0, 99.0])  # detect spans 20ms
+    # First read is the smoothing timestamp (outside the timer); the next two
+    # are the timer's start/end (20ms span).
+    ticks = iter([9.99, 10.0, 10.02, 99.0, 99.0])
     tracker = _FakeTracker(hands_sequence=[[]])
     worker = TrackingWorker(
         tracker, [_FakeDetector()], _provider([(1, _frame())]), clock=lambda: next(ticks)

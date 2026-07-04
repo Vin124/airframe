@@ -16,7 +16,6 @@ from src.tuning import DEFAULT_PINCH_ENTER, DEFAULT_PINCH_EXIT
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
-MIDDLE_MCP = 9   # middle-finger base knuckle -- a stable palm-center proxy
 MIDDLE_TIP = 12
 RING_TIP = 16
 PINKY_TIP = 20
@@ -84,17 +83,14 @@ Point2D = Tuple[float, float]
 class GestureState:
     """Immutable per-frame gesture result for one tracked hand.
 
-    ``grab_point`` is the palm center (middle-finger MCP, landmark 9) in
-    normalized coords -- computed HERE on the tracking thread so the main loop
-    only reads published values and never derives a gesture from raw landmarks.
-    It locates a fist for the fist-to-remove gesture; it defaults to the origin
-    so the three-field keyword constructors used elsewhere keep working.
+    ``is_grab`` is the fist heuristic (shown in the HUD debug label; it no longer
+    drives an interaction -- remove is a trash-corner drag now). All fields are
+    computed on the tracking thread so the main loop only reads published values.
     """
 
     is_pinching: bool
     pinch_point: Point2D
     is_grab: bool
-    grab_point: Point2D = (0.0, 0.0)
 
 
 # Returned when there is no hand to analyze this frame.
@@ -185,7 +181,6 @@ class GestureDetector:
                 is_pinching=False,
                 pinch_point=_NO_HAND_PINCH_POINT,
                 is_grab=False,
-                grab_point=_NO_HAND_PINCH_POINT,
             )
 
         distance, midpoint = pinch_distance_and_midpoint(hand)
@@ -195,11 +190,8 @@ class GestureDetector:
         else:
             self._is_pinching = distance < self._enter_threshold
 
-        px, py, _pz = hand[MIDDLE_MCP]  # palm center, for the fist-to-remove gesture
-
         return GestureState(
             is_pinching=self._is_pinching,
             pinch_point=midpoint,
             is_grab=detect_grab(hand),
-            grab_point=(px, py),
         )

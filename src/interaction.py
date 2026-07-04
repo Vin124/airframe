@@ -223,24 +223,41 @@ def step(
     layer the hand is on; an in-progress gesture can't be stolen. Then advances
     grab/resize on the selected layer and writes it back into the scene.
 
-    ``gesture_states`` is a length-2 list (slot 0 = primary hand); each item only
-    needs ``.is_pinching`` and ``.pinch_point``. Tolerates an empty / unselected
-    scene (legal once the last layer is removed at runtime): nothing moves, but
-    the pinch edge memory is still advanced so a later pinch is a clean edge.
+    ``gesture_states`` is a length-2 list; each item only needs ``.is_pinching``
+    and ``.pinch_point``. EITHER hand can grab/move -- the active hand is whichever
+    is pinching (see ``grab_hands``), so a grab isn't stuck to slot 0; two pinching
+    hands still resize. Tolerates an empty / unselected scene (legal once the last
+    layer is removed at runtime): nothing moves, but the pinch edge memory is still
+    advanced so a later pinch is a clean edge.
 
     Returns the updated ``InteractionState`` and the updated ``Scene``.
     """
-    primary = gesture_states[0]
-    secondary = gesture_states[1]
+    active, other = grab_hands(gesture_states)
 
-    scene = resolve_selection(state, scene, primary, frame_size)
+    scene = resolve_selection(state, scene, active, frame_size)
 
     layer = scene.selected_layer
     if layer is None:
         grab = GrabState(
-            is_grabbed=False, offset=state.grab.offset, was_pinching=primary.is_pinching
+            is_grabbed=False, offset=state.grab.offset, was_pinching=active.is_pinching
         )
         return InteractionState(grab=grab, resize=ResizeState()), scene
 
-    new_state, layer = _advance_selected(state, layer, primary, secondary, frame_size)
+    new_state, layer = _advance_selected(state, layer, active, other, frame_size)
     return new_state, scene.replace_selected(layer)
+
+
+def grab_hands(gesture_states: List[GestureLike]) -> Tuple[GestureLike, GestureLike]:
+    """Pick ``(active, other)``: the hand that drives grab/move, and the other.
+
+    ``active`` is a pinching hand -- EITHER slot -- so a single-hand grab works no
+    matter which hand MediaPipe put in slot 0 (the reported "only the yellow-dot
+    hand moves" bug). ``other`` is the remaining hand, used only for the two-hand
+    resize (which needs both pinch points). Falls back to slot order when neither
+    hand pinches, keeping the edge memory coherent.
+    """
+    for i, gesture in enumerate(gesture_states):
+        if gesture.is_pinching:
+            other = gesture_states[1 - i] if len(gesture_states) > 1 else gesture
+            return gesture, other
+    return gesture_states[0], gesture_states[1]
