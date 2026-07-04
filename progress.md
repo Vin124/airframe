@@ -212,17 +212,18 @@ decisions).
     latency ~2.8 s/call.
   - Phase 14: real Wikimedia fetch for "CFTR protein structure" → 1024×715 BGRA, CC BY-SA
     4.0 attribution, 0.62 s; nonsense query → graceful ddgs fallback.
-- **Phase 16 real GPU generation — NOT verified in this environment (disk-blocked).** torch
-  2.6.0+cu124 (CUDA available) and diffusers 0.39.0 install fine, but the ~7 GB diffusion
-  model can't be held: the disk has only ~8.6 GB free (925 GB drive, 100% full), and a
-  HuggingFace download needs ~2× the model size transiently to finalize, so both SDXL-Turbo
-  and sd-turbo downloaded to full size then failed to finalize and were cleaned up (GPU VRAM
-  never rose above idle → no model ever loaded). Separately, SDXL-Turbo was observed to OOM
-  the 8 GB card even with cpu-offload — which is exactly why the in-engine OOM→sd-turbo
-  fallback was added. The generator CODE is complete, reviewed (PASS, no CRITICAL/HIGH), and
-  fully unit-tested incl. the fallback; the runtime degrades cleanly (a load/OOM failure is
-  caught → one notice → generate returns `None`, app keeps running). **To finish verifying:
-  free ~15 GB of disk, then `--speech --parse --generate` and speak a "generate" request.**
+- **Phase 16 real GPU generation — VERIFIED (sd-turbo).** torch 2.6.0+cu124 (CUDA available)
+  + diffusers 0.39.0. Real generations on the RTX 4060: "a friendly robot mascot" and "a
+  simple red letter A", each a valid 512×512 BGRA image, **warm latency ~1.75 s/image, VRAM
+  peak 1.92 GB** (fp16 + cpu-offload keeps it tiny), first gen+load ~18 s. SDXL-Turbo (the
+  quality default) was observed to OOM the 8 GB card even with cpu-offload — which is exactly
+  what the in-engine OOM→sd-turbo fallback handles. Verification note: this machine's disk is
+  ~100% full (925 GB drive), and earlier attempts pulled BOTH fp16 and fp32 weight sets
+  (~7 GB) which couldn't finalize and left a corrupt partial cache; a targeted **fp16-only**
+  download (~2.7 GB via `allow_patterns`) fit the free space and loaded cleanly. On a card
+  with more headroom, SDXL-Turbo would be used directly. The runtime degrades cleanly on any
+  load/OOM/disk failure (caught → one notice → generate returns `None`, app keeps running),
+  which was itself observed against a real corrupt cache during verification.
 
 ## Key decisions (chunk 3)
 
@@ -249,9 +250,11 @@ decisions).
 
 ## Known limitations / follow-ups (chunk 3)
 
-- **Phase 16 real generation unverified (disk space)** — see Verification above. Also, the
-  first generate is slow on 8 GB (SDXL-Turbo load → OOM → sd-turbo reload) before it settles;
-  making sd-turbo the default on ≤8 GB cards would avoid the one-time OOM tax.
+- **Phase 16 on 8 GB cards** — SDXL-Turbo (the quality default) OOMs the 4060 even with
+  cpu-offload, so the first generate pays a one-time SDXL-load → OOM → sd-turbo-reload tax
+  before settling on sd-turbo (verified working, ~1.75 s/image, 1.92 GB VRAM). Making
+  sd-turbo the default on ≤8 GB cards would avoid that tax. Also, this machine's disk is
+  ~100% full, so the model had to be fetched fp16-only (~2.7 GB) to fit.
 - Speech transcription pauses while a generate request loads the model on the first call
   (both on the speech thread); acceptable, bounded by the worker's daemon + join timeout.
 - The docked preview can be pinch-spawned while it's still a "materializing" placeholder
