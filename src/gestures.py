@@ -16,6 +16,7 @@ from src.tuning import DEFAULT_PINCH_ENTER, DEFAULT_PINCH_EXIT
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+MIDDLE_MCP = 9
 MIDDLE_TIP = 12
 RING_TIP = 16
 PINKY_TIP = 20
@@ -36,8 +37,14 @@ _CURL_FINGER_TIPS = (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
 # thumb occlusion, etc.), so require a majority rather than unanimity.
 _MIN_CURLED_FINGERS_FOR_GRAB = 3
 
-# Pinch thresholds, normalized Euclidean distance (x, y only -- z is noisy
-# depth from MediaPipe and not reliable enough to include here).
+# Pinch thresholds. The pinch metric is a RATIO: the thumb-index distance
+# (x, y only -- z is noisy depth from MediaPipe and not reliable enough to
+# include) divided by the palm length (wrist -> middle-finger MCP, a rigid
+# segment that doesn't change with finger pose). Dividing by the palm makes the
+# metric SCALE-INVARIANT: the same physical finger gap reads the same whether
+# the hand is close to the webcam or far away. The old frame-fraction metric
+# did not have this property -- a far hand's open fingers could fall under the
+# threshold (phantom pinches) while a close hand needed a hard press.
 #
 # Hysteresis: entering pinch requires getting close (tight ENTER threshold);
 # once pinching, fingers can drift a bit farther apart (looser EXIT
@@ -67,12 +74,13 @@ _MIN_CURLED_FINGERS_FOR_GRAB = 3
 #   - EXIT must stay strictly above ENTER or hysteresis has no effect and
 #     flicker comes back; ``src.tuning.clamp_tuning`` enforces a minimum gap on
 #     BOTH the slider and the config-load path so an inverted pair can't slip in.
-#   - These are normalized distances (fraction of the frame, not pixels), so
-#     they scale with hand distance from the camera automatically -- tune at
-#     your typical demo distance from the webcam.
+#   - These are palm-relative ratios (thumb-index distance / palm length), so
+#     they are invariant to hand distance from the camera -- one tuned value
+#     holds up close and at arm's length alike. Touching fingertips land around
+#     0.05-0.20; an open hand sits well above 1.0.
 #
-# Tuned by eye against typical index-thumb spacing at arm's length from a
-# webcam.
+# Defaults chosen to match the old frame-fraction defaults' feel at arm's
+# length from a webcam.
 PINCH_ENTER_THRESHOLD = DEFAULT_PINCH_ENTER
 PINCH_EXIT_THRESHOLD = DEFAULT_PINCH_EXIT
 
@@ -97,17 +105,29 @@ class GestureState:
 _NO_HAND_PINCH_POINT: Point2D = (0.0, 0.0)
 
 
-def pinch_distance_and_midpoint(hand: Hand) -> Tuple[float, Point2D]:
-    """Return (distance, midpoint) between thumb tip and index tip.
+# Floor for the palm-length denominator: a degenerate hand (all landmarks
+# collapsed by a tracking glitch) must not divide by ~zero and explode the
+# ratio; with a palm this small no meaningful pinch decision is possible anyway.
+_MIN_PALM_LENGTH = 1e-6
 
-    Uses only x, y -- z (depth) is unreliable from MediaPipe's monocular
-    estimate and would distort the distance, so it's ignored here.
+
+def pinch_ratio_and_midpoint(hand: Hand) -> Tuple[float, Point2D]:
+    """Return (pinch ratio, midpoint) for the thumb tip / index tip pair.
+
+    The ratio is the thumb-index distance divided by the palm length (wrist ->
+    middle-finger MCP, a rigid segment unaffected by finger pose), which makes
+    it invariant to the hand's distance from the camera. Uses only x, y -- z
+    (depth) is unreliable from MediaPipe's monocular estimate and would distort
+    the distance, so it's ignored here.
     """
     tx, ty, _tz = hand[THUMB_TIP]
     ix, iy, _iz = hand[INDEX_TIP]
-    distance = hypot(ix - tx, iy - ty)
+    wx, wy, _wz = hand[WRIST]
+    mx, my, _mz = hand[MIDDLE_MCP]
+    palm_length = max(hypot(mx - wx, my - wy), _MIN_PALM_LENGTH)
+    ratio = hypot(ix - tx, iy - ty) / palm_length
     midpoint = ((tx + ix) / 2.0, (ty + iy) / 2.0)
-    return distance, midpoint
+    return ratio, midpoint
 
 
 def detect_grab(hand: Hand) -> bool:
@@ -183,12 +203,12 @@ class GestureDetector:
                 is_grab=False,
             )
 
-        distance, midpoint = pinch_distance_and_midpoint(hand)
+        ratio, midpoint = pinch_ratio_and_midpoint(hand)
 
         if self._is_pinching:
-            self._is_pinching = distance < self._exit_threshold
+            self._is_pinching = ratio < self._exit_threshold
         else:
-            self._is_pinching = distance < self._enter_threshold
+            self._is_pinching = ratio < self._enter_threshold
 
         return GestureState(
             is_pinching=self._is_pinching,

@@ -91,6 +91,63 @@ def _idle_gesture_state() -> GestureState:
     return GestureState(is_pinching=False, pinch_point=(0.0, 0.0), is_grab=False)
 
 
+def _wrist_xy(hand: Hand) -> Tuple[float, float]:
+    """The (x, y) of a hand's wrist landmark (index 0)."""
+    x, y, _z = hand[0]
+    return (x, y)
+
+
+class HandSlotMatcher:
+    """Keep each physical hand in a stable detector slot across frames.
+
+    MediaPipe returns detected hands in NO guaranteed order, so with two hands
+    in frame a hand can swap detector slots between frames -- taking the pinch
+    hysteresis latch and the One-Euro filter bank of the OTHER hand with it
+    (a mid-drag pinch teleports to the other hand for a frame). This matcher
+    reorders each frame's two-hand detection so the assignment minimizes total
+    wrist travel from the previous frame's per-slot wrist positions.
+
+    Only the two-hand case needs a decision: zero/one detected hands pass
+    through unchanged (a lone hand stays in slot 0, as before), and the app
+    never tracks more than two. A slot's last wrist is kept while the slot is
+    empty so a hand that drops out for a few frames re-lands in its old slot.
+    Single owner (the tracking thread) -- not thread-safe by design.
+    """
+
+    def __init__(self, num_slots: int) -> None:
+        self._prev_wrists: List[Optional[Tuple[float, float]]] = [None] * num_slots
+
+    @staticmethod
+    def _travel(prev: Optional[Tuple[float, float]], hand: Hand) -> float:
+        """Wrist travel from a slot's previous position; 0 for a fresh slot.
+
+        A ``None`` (never-seen) slot contributes nothing, so the choice is
+        driven entirely by the slots that DO have history.
+        """
+        if prev is None:
+            return 0.0
+        wx, wy = _wrist_xy(hand)
+        return float(np.hypot(wx - prev[0], wy - prev[1]))
+
+    def assign(self, hands: List[Hand]) -> List[Hand]:
+        """Return ``hands`` reordered for slot stability; remember the wrists."""
+        if len(hands) == 2 and len(self._prev_wrists) >= 2:
+            keep = (
+                self._travel(self._prev_wrists[0], hands[0])
+                + self._travel(self._prev_wrists[1], hands[1])
+            )
+            swap = (
+                self._travel(self._prev_wrists[0], hands[1])
+                + self._travel(self._prev_wrists[1], hands[0])
+            )
+            if swap < keep:
+                hands = [hands[1], hands[0]]
+        for slot in range(min(len(hands), len(self._prev_wrists))):
+            if hands[slot]:
+                self._prev_wrists[slot] = _wrist_xy(hands[slot])
+        return hands
+
+
 def initial_result(num_detectors: int) -> TrackingResult:
     """A no-hands result with one idle gesture state per detector.
 
@@ -112,18 +169,23 @@ def detect_and_update(
     frame,
     smoother: Optional["LandmarkSmoother"] = None,
     t: float = 0.0,
+    matcher: Optional[HandSlotMatcher] = None,
 ) -> Tuple[Tuple[Hand, ...], Tuple[GestureState, ...]]:
     """Detect hands, de-jitter them, and feed hand slot ``i`` to ``detectors[i]``.
 
     Returns ``(hands, gesture_states)`` with one gesture state per detector (slot
-    0 = primary hand). When a ``smoother`` is given the raw landmarks are One-Euro
-    smoothed at time ``t`` BEFORE gesture detection, so pinch/grab read a steadier
-    hand (and the published hands the skeleton draws are smoothed too). NOTE:
-    MediaPipe may swap hand order between frames, so a hand can jump detector
-    slots; that's accepted MVP jitter (see CLAUDE.md). Kept a free function so it's
-    testable with a fake tracker and fake detectors.
+    0 = primary hand). When a ``matcher`` is given, a two-hand detection is
+    reordered FIRST so each physical hand keeps its slot across frames (MediaPipe
+    guarantees no order) -- the per-slot smoother banks and gesture hysteresis
+    latches then stay attached to the same hand. When a ``smoother`` is given the
+    slot-matched raw landmarks are One-Euro smoothed at time ``t`` BEFORE gesture
+    detection, so pinch/grab read a steadier hand (and the published hands the
+    skeleton draws are smoothed too). Kept a free function so it's testable with a
+    fake tracker and fake detectors.
     """
     hands = list(tracker.detect(frame))
+    if matcher is not None:
+        hands = matcher.assign(hands)
     if smoother is not None:
         hands = smoother.smooth(hands, t)
     hands = tuple(hands)
@@ -157,6 +219,10 @@ class TrackingWorker:
         # One-Euro landmark smoother (de-jitters MediaPipe output before gesture
         # detection); owned solely by this thread, one filter bank per hand slot.
         self._smoother = LandmarkSmoother(len(detectors))
+        # Slot matcher: keeps each physical hand in the same detector/smoother
+        # slot across frames (MediaPipe's output order is unstable with two
+        # hands). Owned solely by this thread, like the smoother.
+        self._matcher = HandSlotMatcher(len(detectors))
         self._result = initial_result(len(detectors))
         self._last_seq = 0
         # Live pinch tuning: the main thread publishes a new GestureTuning here
@@ -225,7 +291,8 @@ class TrackingWorker:
         now = self._clock()  # smoothing timestamp, read outside the timed region
         with StageTimer(self._clock) as timer:
             hands, gesture_states = detect_and_update(
-                self._tracker, self._detectors, frame, self._smoother, now
+                self._tracker, self._detectors, frame, self._smoother, now,
+                self._matcher,
             )
         self._last_seq = seq
         self._result = TrackingResult(  # single atomic publish

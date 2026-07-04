@@ -21,8 +21,8 @@ def test_default_config_has_expected_keys_and_values():
         "speech": False,
         "parse": False,
         "generate": False,
-        "pinch_enter": 0.05,
-        "pinch_exit": 0.07,
+        "pinch_enter": 0.30,
+        "pinch_exit": 0.45,
         "min_detection_confidence": 0.5,
         "min_presence_confidence": 0.5,
         "min_tracking_confidence": 0.5,
@@ -46,8 +46,8 @@ def test_merge_overlays_loaded_values_over_defaults():
             "speech": True,
             "parse": True,
             "generate": True,
-            "pinch_enter": 0.04,
-            "pinch_exit": 0.09,
+            "pinch_enter": 0.25,
+            "pinch_exit": 0.55,
             "min_detection_confidence": 0.6,
             "min_presence_confidence": 0.7,
             "min_tracking_confidence": 0.8,
@@ -62,8 +62,8 @@ def test_merge_overlays_loaded_values_over_defaults():
         "speech": True,
         "parse": True,
         "generate": True,
-        "pinch_enter": 0.04,
-        "pinch_exit": 0.09,
+        "pinch_enter": 0.25,
+        "pinch_exit": 0.55,
         "min_detection_confidence": 0.6,
         "min_presence_confidence": 0.7,
         "min_tracking_confidence": 0.8,
@@ -148,8 +148,8 @@ def test_save_then_load_roundtrips(tmp_path):
         "speech": True,
         "parse": True,
         "generate": True,
-        "pinch_enter": 0.04,
-        "pinch_exit": 0.09,
+        "pinch_enter": 0.25,
+        "pinch_exit": 0.55,
         "min_detection_confidence": 0.6,
         "min_presence_confidence": 0.7,
         "min_tracking_confidence": 0.8,
@@ -164,28 +164,36 @@ def test_save_then_load_roundtrips(tmp_path):
 
 def test_merge_defaults_pinch_when_absent():
     merged = config.merge_config({"source": "image"})
-    assert merged["pinch_enter"] == 0.05
-    assert merged["pinch_exit"] == 0.07
+    assert merged["pinch_enter"] == 0.30
+    assert merged["pinch_exit"] == 0.45
 
 
 def test_merge_rejects_out_of_range_or_wrongtype_pinch():
     # Wrong type / out of range -> that key falls back to its default.
     merged = config.merge_config({"pinch_enter": "lots", "pinch_exit": 99.0})
-    assert merged["pinch_enter"] == 0.05
-    assert merged["pinch_exit"] == 0.07
+    assert merged["pinch_enter"] == 0.30
+    assert merged["pinch_exit"] == 0.45
+
+
+def test_merge_rejects_stale_frame_fraction_pinch_values():
+    # Values persisted under the old frame-fraction metric (typically 0.01-0.09)
+    # fall below the ratio metric's minimum and reset to the new defaults.
+    merged = config.merge_config({"pinch_enter": 0.05, "pinch_exit": 0.07})
+    assert merged["pinch_enter"] == 0.30
+    assert merged["pinch_exit"] == 0.45
 
 
 def test_merge_enforces_hysteresis_gap_on_pinch_pair():
     # Both in range but inverted -> the shared clamp lifts exit above enter.
-    merged = config.merge_config({"pinch_enter": 0.08, "pinch_exit": 0.06})
-    assert merged["pinch_enter"] == 0.08
+    merged = config.merge_config({"pinch_enter": 0.50, "pinch_exit": 0.40})
+    assert merged["pinch_enter"] == 0.50
     assert merged["pinch_exit"] > merged["pinch_enter"]
 
 
 def test_merge_rejects_bool_pinch_values():
     merged = config.merge_config({"pinch_enter": True, "pinch_exit": False})
-    assert merged["pinch_enter"] == 0.05
-    assert merged["pinch_exit"] == 0.07
+    assert merged["pinch_enter"] == 0.30
+    assert merged["pinch_exit"] == 0.45
 
 
 def test_merge_validates_confidence_range():

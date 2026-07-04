@@ -27,20 +27,20 @@ def test_valid_pair_passes_through_unchanged():
 
 
 def test_inverted_pair_lifts_exit_above_enter():
-    tuning = clamp_tuning(0.08, 0.06)  # exit below enter
-    assert tuning.enter == pytest.approx(0.08)
-    assert tuning.exit == pytest.approx(0.08 + MIN_HYSTERESIS_GAP)
+    tuning = clamp_tuning(0.50, 0.40)  # exit below enter
+    assert tuning.enter == pytest.approx(0.50)
+    assert tuning.exit == pytest.approx(0.50 + MIN_HYSTERESIS_GAP)
     assert tuning.exit > tuning.enter
 
 
 def test_equal_pair_gets_minimum_gap():
-    tuning = clamp_tuning(0.05, 0.05)
-    assert tuning.enter == pytest.approx(0.05)
-    assert tuning.exit == pytest.approx(0.05 + MIN_HYSTERESIS_GAP)
+    tuning = clamp_tuning(0.35, 0.35)
+    assert tuning.enter == pytest.approx(0.35)
+    assert tuning.exit == pytest.approx(0.35 + MIN_HYSTERESIS_GAP)
 
 
 def test_out_of_range_high_pulled_into_range_keeping_gap():
-    tuning = clamp_tuning(0.2, 0.3)  # both above the max
+    tuning = clamp_tuning(1.2, 1.5)  # both above the max
     assert tuning.exit == pytest.approx(PINCH_THRESHOLD_MAX)
     assert tuning.enter == pytest.approx(PINCH_THRESHOLD_MAX - MIN_HYSTERESIS_GAP)
     assert PINCH_THRESHOLD_MIN <= tuning.enter <= PINCH_THRESHOLD_MAX

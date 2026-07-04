@@ -1032,8 +1032,8 @@ def test_resolve_prefill_pinch_from_config_no_cli():
 def test_resolve_prefill_pinch_defaults_when_absent():
     args = parse_args(["--mode", "skeleton"])
     pf = resolve_panel_prefill(args, _FULL_CFG)  # no pinch keys
-    assert pf["pinch_enter"] == 0.05
-    assert pf["pinch_exit"] == 0.07
+    assert pf["pinch_enter"] == 0.30
+    assert pf["pinch_exit"] == 0.45
 
 
 def test_resolve_prefill_confidence_cli_nondefault_wins():

@@ -8,13 +8,14 @@ from src.gestures import (
     PINCH_ENTER_THRESHOLD,
     PINCH_EXIT_THRESHOLD,
     detect_grab,
-    pinch_distance_and_midpoint,
+    pinch_ratio_and_midpoint,
 )
 
 
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+MIDDLE_MCP = 9
 MIDDLE_TIP = 12
 RING_TIP = 16
 PINKY_TIP = 20
@@ -30,11 +31,15 @@ PINKY_PIP = 18
 def _open_hand() -> list:
     """21 landmarks for a fully open hand: fingertips far from the wrist.
 
-    Wrist at the origin; each fingertip is placed well beyond its PIP/MCP
-    joint so nothing is curled and thumb/index are far apart (no pinch).
+    Wrist at the bottom; each fingertip is placed well beyond its PIP/MCP
+    joint so nothing is curled and thumb/index are far apart (no pinch). The
+    middle-finger MCP sits exactly 1.0 from the wrist, so the pinch RATIO
+    (thumb-index distance / palm length) equals the raw thumb-index distance
+    and test geometry stays easy to reason about.
     """
     hand = [(0.0, 0.0, 0.0)] * 21
     hand[WRIST] = (0.5, 0.9, 0.0)
+    hand[MIDDLE_MCP] = (0.5, -0.1, 0.0)  # palm length exactly 1.0
     hand[THUMB_TIP] = (0.3, 0.5, 0.0)
     hand[INDEX_TIP] = (0.7, 0.1, 0.0)
 
@@ -69,25 +74,64 @@ def _curled_hand() -> list:
     return hand
 
 
-def test_pinch_distance_and_midpoint_math():
+def test_pinch_ratio_and_midpoint_math():
     hand = [(0.0, 0.0, 0.0)] * 21
+    hand[WRIST] = (0.0, 0.0, 0.0)
+    hand[MIDDLE_MCP] = (0.0, 1.0, 0.0)  # palm length 1.0 -> ratio == distance
     hand[THUMB_TIP] = (0.0, 0.0, 0.0)
     hand[INDEX_TIP] = (0.3, 0.4, 0.0)  # 3-4-5 triangle -> distance 0.5
 
-    distance, midpoint = pinch_distance_and_midpoint(hand)
+    ratio, midpoint = pinch_ratio_and_midpoint(hand)
 
-    assert distance == 0.5
+    assert ratio == 0.5
     assert midpoint == (0.15, 0.2)
 
 
-def test_pinch_distance_ignores_z():
+def test_pinch_ratio_normalized_by_palm_length():
+    # Same finger gap over half the palm length -> double the ratio.
     hand = [(0.0, 0.0, 0.0)] * 21
+    hand[WRIST] = (0.0, 0.0, 0.0)
+    hand[MIDDLE_MCP] = (0.0, 0.5, 0.0)  # palm length 0.5
+    hand[THUMB_TIP] = (0.0, 0.0, 0.0)
+    hand[INDEX_TIP] = (0.3, 0.4, 0.0)  # distance 0.5
+
+    ratio, _midpoint = pinch_ratio_and_midpoint(hand)
+
+    assert ratio == pytest.approx(1.0)
+
+
+def test_pinch_ratio_is_scale_invariant():
+    # Shrinking the whole hand (a hand farther from the camera) must not
+    # change the ratio -- this is the property the palm normalization buys.
+    hand = _open_hand()
+    shrunk = [(x * 0.25, y * 0.25, z) for (x, y, z) in hand]
+
+    ratio, _ = pinch_ratio_and_midpoint(hand)
+    shrunk_ratio, _ = pinch_ratio_and_midpoint(shrunk)
+
+    assert shrunk_ratio == pytest.approx(ratio)
+
+
+def test_pinch_ratio_ignores_z():
+    hand = [(0.0, 0.0, 0.0)] * 21
+    hand[WRIST] = (0.0, 0.0, 0.0)
+    hand[MIDDLE_MCP] = (0.0, 1.0, 0.0)
     hand[THUMB_TIP] = (0.0, 0.0, 0.0)
     hand[INDEX_TIP] = (0.0, 0.0, 100.0)  # huge z difference, x/y identical
 
-    distance, _midpoint = pinch_distance_and_midpoint(hand)
+    ratio, _midpoint = pinch_ratio_and_midpoint(hand)
 
-    assert distance == 0.0
+    assert ratio == 0.0
+
+
+def test_pinch_ratio_degenerate_palm_does_not_explode():
+    # All landmarks collapsed (tracking glitch): the epsilon floor keeps the
+    # ratio finite instead of dividing by zero.
+    hand = [(0.5, 0.5, 0.0)] * 21
+
+    ratio, _midpoint = pinch_ratio_and_midpoint(hand)
+
+    assert ratio == 0.0
 
 
 def test_detect_grab_true_for_curled_hand():
@@ -108,13 +152,8 @@ def test_detector_no_hand_returns_open_non_pinching_state():
 
 
 def test_detector_crossing_enter_threshold_starts_pinch():
-    hand = [(0.0, 0.0, 0.0)] * 21
-    hand[WRIST] = (0.5, 0.9, 0.0)
-    hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    hand[INDEX_TIP] = (0.5, 0.5 + (PINCH_ENTER_THRESHOLD - 0.01), 0.0)
-
     detector = GestureDetector()
-    state = detector.update(hand)
+    state = detector.update(_hand_with_gap(PINCH_ENTER_THRESHOLD - 0.01))
 
     assert state.is_pinching is True
 
@@ -122,21 +161,13 @@ def test_detector_crossing_enter_threshold_starts_pinch():
 def test_detector_staying_between_enter_and_exit_keeps_pinching():
     detector = GestureDetector()
 
-    close_hand = [(0.0, 0.0, 0.0)] * 21
-    close_hand[WRIST] = (0.5, 0.9, 0.0)
-    close_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    close_hand[INDEX_TIP] = (0.5, 0.5 + (PINCH_ENTER_THRESHOLD - 0.01), 0.0)
-    first_state = detector.update(close_hand)
+    first_state = detector.update(_hand_with_gap(PINCH_ENTER_THRESHOLD - 0.01))
     assert first_state.is_pinching is True
 
-    # Distance now between ENTER and EXIT: wouldn't newly trigger a pinch,
+    # Ratio now between ENTER and EXIT: wouldn't newly trigger a pinch,
     # but hysteresis should hold the already-pinching state.
-    mid_distance = (PINCH_ENTER_THRESHOLD + PINCH_EXIT_THRESHOLD) / 2.0
-    drifted_hand = [(0.0, 0.0, 0.0)] * 21
-    drifted_hand[WRIST] = (0.5, 0.9, 0.0)
-    drifted_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    drifted_hand[INDEX_TIP] = (0.5, 0.5 + mid_distance, 0.0)
-    second_state = detector.update(drifted_hand)
+    mid_ratio = (PINCH_ENTER_THRESHOLD + PINCH_EXIT_THRESHOLD) / 2.0
+    second_state = detector.update(_hand_with_gap(mid_ratio))
 
     assert second_state.is_pinching is True
 
@@ -144,18 +175,10 @@ def test_detector_staying_between_enter_and_exit_keeps_pinching():
 def test_detector_crossing_exit_threshold_stops_pinching():
     detector = GestureDetector()
 
-    close_hand = [(0.0, 0.0, 0.0)] * 21
-    close_hand[WRIST] = (0.5, 0.9, 0.0)
-    close_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    close_hand[INDEX_TIP] = (0.5, 0.5 + (PINCH_ENTER_THRESHOLD - 0.01), 0.0)
-    first_state = detector.update(close_hand)
+    first_state = detector.update(_hand_with_gap(PINCH_ENTER_THRESHOLD - 0.01))
     assert first_state.is_pinching is True
 
-    far_hand = [(0.0, 0.0, 0.0)] * 21
-    far_hand[WRIST] = (0.5, 0.9, 0.0)
-    far_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    far_hand[INDEX_TIP] = (0.5, 0.5 + (PINCH_EXIT_THRESHOLD + 0.01), 0.0)
-    second_state = detector.update(far_hand)
+    second_state = detector.update(_hand_with_gap(PINCH_EXIT_THRESHOLD + 0.01))
 
     assert second_state.is_pinching is False
 
@@ -179,22 +202,21 @@ def test_detector_pinch_point_is_midpoint_of_thumb_and_index():
 
 
 def _hand_with_gap(gap: float) -> list:
-    """A hand whose thumb-index distance equals ``gap`` (wrist far away, open)."""
+    """A hand whose pinch RATIO equals ``gap``: unit palm, thumb-index = gap."""
     hand = [(0.0, 0.0, 0.0)] * 21
     hand[WRIST] = (0.5, 0.9, 0.0)
+    hand[MIDDLE_MCP] = (0.5, -0.1, 0.0)  # palm length exactly 1.0
     hand[THUMB_TIP] = (0.5, 0.5, 0.0)
     hand[INDEX_TIP] = (0.5, 0.5 + gap, 0.0)
     return hand
 
 
 def test_detector_honors_injected_enter_threshold():
-    # Custom tight thresholds: a gap of 0.02 is under a 0.03 enter -> pinch;
-    # the same gap would NOT pinch under the module default (0.05 enter is
-    # looser, but 0.02 < 0.05 so it would... use a gap that separates them).
+    # Custom tight thresholds: a ratio of 0.02 is under a 0.03 enter -> pinch.
     detector = GestureDetector(enter_threshold=0.03, exit_threshold=0.05)
     assert detector.update(_hand_with_gap(0.02)).is_pinching is True  # < enter
-    # A fresh detector: a 0.04 gap is above the 0.03 enter -> no pinch, even
-    # though it's below the module default enter (0.05) -- proves the injected
+    # A fresh detector: a 0.04 ratio is above the 0.03 enter -> no pinch, even
+    # though it's well below the module default enter -- proves the injected
     # threshold, not the module constant, is used on the ENTER path.
     fresh = GestureDetector(enter_threshold=0.03, exit_threshold=0.05)
     assert fresh.update(_hand_with_gap(0.04)).is_pinching is False
@@ -229,21 +251,13 @@ def test_detector_defaults_match_module_thresholds():
 def test_detector_resets_pinch_state_after_hand_lost():
     detector = GestureDetector()
 
-    close_hand = [(0.0, 0.0, 0.0)] * 21
-    close_hand[WRIST] = (0.5, 0.9, 0.0)
-    close_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    close_hand[INDEX_TIP] = (0.5, 0.5 + (PINCH_ENTER_THRESHOLD - 0.01), 0.0)
-    assert detector.update(close_hand).is_pinching is True
+    assert detector.update(_hand_with_gap(PINCH_ENTER_THRESHOLD - 0.01)).is_pinching is True
 
     assert detector.update(None).is_pinching is False
 
-    # A distance that would have kept a pre-existing pinch alive (between
+    # A ratio that would have kept a pre-existing pinch alive (between
     # enter and exit) must NOT resume pinching after a reset -- it has to
     # cross the tighter enter threshold again.
-    mid_distance = (PINCH_ENTER_THRESHOLD + PINCH_EXIT_THRESHOLD) / 2.0
-    drifted_hand = [(0.0, 0.0, 0.0)] * 21
-    drifted_hand[WRIST] = (0.5, 0.9, 0.0)
-    drifted_hand[THUMB_TIP] = (0.5, 0.5, 0.0)
-    drifted_hand[INDEX_TIP] = (0.5, 0.5 + mid_distance, 0.0)
+    mid_ratio = (PINCH_ENTER_THRESHOLD + PINCH_EXIT_THRESHOLD) / 2.0
 
-    assert detector.update(drifted_hand).is_pinching is False
+    assert detector.update(_hand_with_gap(mid_ratio)).is_pinching is False

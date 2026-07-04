@@ -10,6 +10,7 @@ import pytest
 
 from src.gestures import GestureState
 from src.tracking import (
+    HandSlotMatcher,
     TrackingResult,
     TrackingWorker,
     detect_and_update,
@@ -89,6 +90,83 @@ def test_detect_and_update_no_hands_gives_idle_states():
     hands, gestures = detect_and_update(tracker, detectors, _frame())
     assert hands == ()
     assert gestures[0].is_pinching is False
+
+
+# --------------------------------------------------------------------------- #
+# HandSlotMatcher (pure)
+# --------------------------------------------------------------------------- #
+
+def _hand_at(x: float, y: float) -> list:
+    """A minimal hand: just a wrist landmark at (x, y)."""
+    return [(x, y, 0.0)]
+
+
+def test_matcher_first_frame_passes_through():
+    matcher = HandSlotMatcher(2)
+    left, right = _hand_at(0.2, 0.5), _hand_at(0.8, 0.5)
+    assert matcher.assign([left, right]) == [left, right]
+
+
+def test_matcher_unswaps_two_hands():
+    matcher = HandSlotMatcher(2)
+    matcher.assign([_hand_at(0.2, 0.5), _hand_at(0.8, 0.5)])
+
+    # Next frame MediaPipe reports the same two hands in the OPPOSITE order
+    # (each moved only slightly): the matcher must restore the slot order.
+    right_moved, left_moved = _hand_at(0.79, 0.5), _hand_at(0.21, 0.5)
+    assert matcher.assign([right_moved, left_moved]) == [left_moved, right_moved]
+
+
+def test_matcher_keeps_stable_order():
+    matcher = HandSlotMatcher(2)
+    matcher.assign([_hand_at(0.2, 0.5), _hand_at(0.8, 0.5)])
+
+    left_moved, right_moved = _hand_at(0.22, 0.5), _hand_at(0.78, 0.5)
+    assert matcher.assign([left_moved, right_moved]) == [left_moved, right_moved]
+
+
+def test_matcher_single_hand_passes_through():
+    matcher = HandSlotMatcher(2)
+    lone = _hand_at(0.5, 0.5)
+    assert matcher.assign([lone]) == [lone]
+    assert matcher.assign([]) == []
+
+
+def test_matcher_new_second_hand_takes_the_free_slot():
+    matcher = HandSlotMatcher(2)
+    # One hand tracked in slot 0...
+    matcher.assign([_hand_at(0.2, 0.5)])
+
+    # ...then a second hand appears and MediaPipe lists it FIRST: the original
+    # hand must keep slot 0 (its hysteresis/smoothing), the new one gets slot 1.
+    new_hand, original = _hand_at(0.8, 0.5), _hand_at(0.21, 0.5)
+    assert matcher.assign([new_hand, original]) == [original, new_hand]
+
+
+def test_matcher_remembers_slots_across_an_empty_frame():
+    matcher = HandSlotMatcher(2)
+    matcher.assign([_hand_at(0.2, 0.5), _hand_at(0.8, 0.5)])
+    matcher.assign([])  # both hands lost for a frame
+
+    right_back, left_back = _hand_at(0.8, 0.5), _hand_at(0.2, 0.5)
+    assert matcher.assign([right_back, left_back]) == [left_back, right_back]
+
+
+def test_detect_and_update_applies_the_matcher():
+    matcher = HandSlotMatcher(2)
+    matcher.assign([_hand_at(0.2, 0.5), _hand_at(0.8, 0.5)])
+
+    right_moved, left_moved = _hand_at(0.79, 0.5), _hand_at(0.21, 0.5)
+    tracker = _FakeTracker(hands_sequence=[[right_moved, left_moved]])
+    detectors = [_FakeDetector(), _FakeDetector()]
+
+    hands, _gestures = detect_and_update(
+        tracker, detectors, _frame(), matcher=matcher
+    )
+
+    assert hands == (left_moved, right_moved)
+    assert detectors[0].updates == [left_moved]
+    assert detectors[1].updates == [right_moved]
 
 
 # --------------------------------------------------------------------------- #

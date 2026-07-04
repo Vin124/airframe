@@ -19,24 +19,33 @@ tuning, used by the panel path and by config load alike.
 
 from dataclasses import dataclass
 
-# Slider / config range for both pinch thresholds (normalized index-thumb
-# distance, a fraction of the frame -- not pixels). The panel Scale widgets span
-# this window and ``src.config.merge_config`` rejects anything outside it.
-PINCH_THRESHOLD_MIN = 0.01
-PINCH_THRESHOLD_MAX = 0.15
+# Slider / config range for both pinch thresholds. Since the palm-normalized
+# metric landed, a threshold is a RATIO: index-thumb distance divided by the
+# palm length (wrist -> middle-finger MCP), so it's invariant to how far the
+# hand is from the camera. Touching fingertips read ~0.05-0.20; an open hand
+# reads well above 1.0. The panel Scale widgets span this window and
+# ``src.config.merge_config`` rejects anything outside it (which also cleanly
+# retires stale configs persisted under the old frame-fraction metric, whose
+# 0.01-0.15 values mostly fall below this minimum).
+PINCH_THRESHOLD_MIN = 0.10
+PINCH_THRESHOLD_MAX = 0.90
 
-# Built-in pinch defaults, tuned by eye at arm's length (see the HOW TO TUNE
-# block in ``src.gestures``). ``src.gestures`` re-exports these as the
-# ``PINCH_ENTER_THRESHOLD`` / ``PINCH_EXIT_THRESHOLD`` names it has always used.
-DEFAULT_PINCH_ENTER = 0.05
-DEFAULT_PINCH_EXIT = 0.07
+# Built-in pinch defaults, tuned to match the old frame-fraction defaults'
+# arm's-length feel (0.05 absolute over a ~0.15-0.20 palm ~= 0.30 ratio; see the
+# HOW TO TUNE block in ``src.gestures``). ``src.gestures`` re-exports these as
+# the ``PINCH_ENTER_THRESHOLD`` / ``PINCH_EXIT_THRESHOLD`` names it has always
+# used.
+DEFAULT_PINCH_ENTER = 0.30
+DEFAULT_PINCH_EXIT = 0.45
 
 # Minimum enter/exit separation. Hysteresis only works when exit sits strictly
 # ABOVE enter: entering a pinch needs the tight ENTER distance, but once pinching
 # the fingers may drift out to the looser EXIT distance before releasing. If the
 # two collapse (equal or inverted) the pinch label flickers on/off as the fingers
 # hover at a single boundary. ``clamp_tuning`` guarantees at least this gap.
-MIN_HYSTERESIS_GAP = 0.005
+# Scaled with the ratio metric's range (tremor near the boundary is ~0.02 of a
+# palm length, vs ~0.003 of a frame under the old metric).
+MIN_HYSTERESIS_GAP = 0.03
 
 # MediaPipe's own default for all three min-confidence knobs, and their valid
 # range. Startup-only (a change needs a tracker re-init) -- CLI/config, no slider.
