@@ -1,15 +1,19 @@
-# handy 🖐️
+<p align="center">
+  <img src="assets/banner.png" alt="handy" width="620" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/Vin124/handy/actions/workflows/ci.yml"><img src="https://github.com/Vin124/handy/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+" /></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4.svg" alt="Platform: Windows" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
+</p>
 
 **Control your screen with your hands.** A real-time, gesture-driven overlay
 studio for Windows: grab images, live windows, or your whole monitor with a
 pinch, move and resize them mid-air, draw in the air, summon pictures with your
 voice — and broadcast the whole composition to a virtual camera for any video
 call.
-
-[![CI](https://github.com/Vin124/handy/actions/workflows/ci.yml/badge.svg)](https://github.com/Vin124/handy/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4.svg)](#requirements)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 <!-- TODO: record a short demo GIF (pinch-grab -> resize -> air-draw -> voice spawn) and embed it here:
 ![demo](assets/demo.gif)
