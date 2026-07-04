@@ -1,13 +1,14 @@
-"""Unit tests for Phase 11 air-drawing wiring on the main loop.
+"""Unit tests for air-drawing (pinch-to-ink draw mode) + fist-to-remove on the
+main loop. Headless -- fake webcam, no sinks/worker/camera/display, synthetic
+gesture states only.
 
-Covers the PipelineRuntime stroke lifecycle (append / clear / release-freeze),
-the draw-vs-pinch precedence rule (suppress_draw_pinch, standalone + through
-interaction.step), and the c/k/[/] drawing keys. Headless -- fake webcam, no
-sinks/worker/camera/display, synthetic gesture states only.
+Draw model: 'd' toggles draw mode; in it a PINCH is the pen (down while pinching,
+up on release), and toggling draw mode off freezes the strokes into one layer.
+Out of draw mode a pinch grabs/moves normally (the regression that the old
+always-on draw pose caused) and a held fist over a layer removes it.
 """
 
 import numpy as np
-import pytest
 
 from src.drawing import (
     DEFAULT_STROKE_WIDTH,
@@ -15,18 +16,20 @@ from src.drawing import (
     MIN_STROKE_WIDTH,
     STROKE_PALETTE,
     STROKE_WIDTH_STEP,
-    Stroke,
+    DrawState,
 )
 from src.gestures import GestureState
-from src.interaction import InteractionState, step
+from src.interaction import GrabState, InteractionState
+from src.layers import fist_removal_target
 from src.main import (
     CLEAR_STROKE_KEY,
     CYCLE_COLOR_KEY,
+    DRAW_MODE_KEY,
+    FIST_REMOVE_FRAMES,
     STROKE_WIDTH_DOWN_KEY,
     STROKE_WIDTH_UP_KEY,
     PipelineRuntime,
     parse_args,
-    suppress_draw_pinch,
 )
 from src.scene import Layer, Scene, Transform
 from src.sources import ArraySource
@@ -45,7 +48,7 @@ class _FakePacketWebcam:
 class _FakeSource(Source):
     """A source with a fixed base_size for building selectable layers."""
 
-    def __init__(self, base_size: Size = (10, 10)) -> None:
+    def __init__(self, base_size: Size = (40, 40)) -> None:
         self._base_size = base_size
 
     def read(self):
@@ -56,9 +59,17 @@ class _FakeSource(Source):
         return self._base_size
 
 
+class _Tracking:
+    """Minimal TrackingResult stand-in: gesture states + (optional) hands."""
+
+    def __init__(self, gesture_states, hands=()):
+        self.gesture_states = tuple(gesture_states)
+        self.hands = tuple(hands)
+
+
 def _image_runtime(scene=None, interaction=None) -> PipelineRuntime:
     args = parse_args(["--mode", "image", "--image", "assets/test.png"])
-    return PipelineRuntime(
+    rt = PipelineRuntime(
         args,
         _FakePacketWebcam(),
         None,
@@ -67,227 +78,210 @@ def _image_runtime(scene=None, interaction=None) -> PipelineRuntime:
         None,
         None,
     )
+    rt._frame_size = FRAME_SIZE  # as if a frame has flowed (for freeze placement)
+    return rt
 
 
-def _draw(point) -> GestureState:
-    """A drawing gesture (is_draw latched) reporting its fingertip point."""
-    return GestureState(
-        is_pinching=False, pinch_point=(0.0, 0.0), is_grab=False,
-        is_draw=True, draw_point=point,
-    )
+def _pinch(point) -> GestureState:
+    return GestureState(is_pinching=True, pinch_point=point, is_grab=False)
 
 
 def _idle() -> GestureState:
     return GestureState(is_pinching=False, pinch_point=(0.0, 0.0), is_grab=False)
 
 
-def _feed_draw(runtime, points) -> None:
-    for point in points:
-        runtime._advance_drawing([_draw(point), _idle()], FRAME_SIZE)
+def _fist(point) -> GestureState:
+    return GestureState(is_pinching=False, pinch_point=(0.0, 0.0), is_grab=True, grab_point=point)
+
+
+def _advance(rt, gesture_states) -> None:
+    # The real runtime always tracks two hands (slot 0 = primary); pad so
+    # interaction.step's two-hand resize read never runs off the end.
+    states = list(gesture_states)
+    while len(states) < 2:
+        states.append(_idle())
+    rt._advance_scene(_Tracking(states), FRAME_SIZE)
+
+
+def _layer_scene() -> Scene:
+    """A scene with one 40x40 layer centered at (0.5, 0.5) -> covers ~0.3..0.7."""
+    return Scene().add_layer(Layer(source=_FakeSource((40, 40)), transform=Transform(0.5, 0.5)))
 
 
 # --------------------------------------------------------------------------- #
-# Stroke lifecycle: append while drawing
+# Draw mode toggle
 # --------------------------------------------------------------------------- #
 
-def test_advance_drawing_starts_and_extends_a_stroke():
+def test_draw_mode_off_by_default():
     rt = _image_runtime()
-    assert rt._stroke is None
-    _feed_draw(rt, [(0.3, 0.4)])
-    assert rt._stroke is not None
-    assert rt._stroke.points == ((0.3, 0.4),)
-    _feed_draw(rt, [(0.35, 0.45)])
-    assert rt._stroke.points == ((0.3, 0.4), (0.35, 0.45))
+    assert rt._draw.mode is False
 
 
-def test_advance_drawing_ignores_hand_when_not_drawing():
+def test_d_key_toggles_draw_mode():
     rt = _image_runtime()
-    rt._advance_drawing([_idle(), _idle()], FRAME_SIZE)
-    assert rt._stroke is None
+    rt._handle_drawing_key(DRAW_MODE_KEY)
+    assert rt._draw.mode is True
+    rt._handle_drawing_key(DRAW_MODE_KEY)
+    assert rt._draw.mode is False
 
 
 # --------------------------------------------------------------------------- #
-# Release: freeze into a scene layer (>= 2 points), discard otherwise
+# Pinch-to-ink: in draw mode a pinch is the pen
 # --------------------------------------------------------------------------- #
 
-def test_release_freezes_stroke_into_selected_array_layer():
+def test_pinch_inks_while_in_draw_mode():
+    rt = _image_runtime()
+    rt.toggle_draw_mode()
+    _advance(rt, [_pinch((0.3, 0.4))])
+    _advance(rt, [_pinch((0.35, 0.45))])
+    assert rt._draw.current == ((0.3, 0.4), (0.35, 0.45))
+
+
+def test_pinch_release_banks_the_stroke():
+    rt = _image_runtime()
+    rt.toggle_draw_mode()
+    _advance(rt, [_pinch((0.3, 0.4))])
+    _advance(rt, [_pinch((0.35, 0.45))])
+    _advance(rt, [_idle()])  # pen up
+    assert rt._draw.current == ()
+    assert rt._draw.segments == (((0.3, 0.4), (0.35, 0.45)),)
+
+
+def test_no_ink_outside_draw_mode():
+    # THE regression fix: with draw mode off, a pinch never draws.
+    rt = _image_runtime()
+    _advance(rt, [_pinch((0.3, 0.4))])
+    assert rt._draw.is_empty is True
+
+
+# --------------------------------------------------------------------------- #
+# Freeze on toggling draw mode off
+# --------------------------------------------------------------------------- #
+
+def test_toggle_off_freezes_strokes_into_one_layer():
     rt = _image_runtime(scene=Scene())
-    _feed_draw(rt, [(0.2, 0.6), (0.25, 0.65), (0.3, 0.7), (0.35, 0.75), (0.4, 0.8)])
-    assert len(rt.scene.layers) == 0  # nothing frozen while still drawing
-    # Release: a non-draw gesture on the next tick.
-    rt._advance_drawing([_idle(), _idle()], FRAME_SIZE)
-    assert rt._stroke is None
+    rt.toggle_draw_mode()
+    for p in [(0.2, 0.6), (0.25, 0.65), (0.3, 0.7)]:
+        _advance(rt, [_pinch(p)])
+    _advance(rt, [_idle()])  # bank stroke 1
+    for p in [(0.6, 0.2), (0.65, 0.25), (0.7, 0.3)]:
+        _advance(rt, [_pinch(p)])
+    rt.toggle_draw_mode()  # freeze both strokes
+    assert rt._draw.mode is False
     assert len(rt.scene.layers) == 1
-    frozen = rt.scene.selected_layer
-    assert isinstance(frozen.source, ArraySource)
-    assert frozen.source.base_size is not None  # a real rasterized image
-    assert frozen.source.read().shape[2] == 4  # BGRA
+    assert isinstance(rt.scene.selected_layer.source, ArraySource)
+    assert rt._draw.is_empty is True  # buffers cleared after freeze
 
 
-def test_release_places_layer_where_it_was_drawn():
+def test_toggle_off_with_nothing_drawn_adds_no_layer():
     rt = _image_runtime(scene=Scene())
-    # Stroke centered around (0.3, 0.7) -- clearly off the default (0.5, 0.5).
-    _feed_draw(rt, [(0.2, 0.6), (0.25, 0.65), (0.3, 0.7), (0.35, 0.75), (0.4, 0.8)])
-    rt._advance_drawing([_idle(), _idle()], FRAME_SIZE)
-    t = rt.scene.selected_layer.transform
-    assert 0.25 < t.center_x < 0.35
-    assert 0.65 < t.center_y < 0.75
-
-
-def test_release_with_one_point_discards_without_a_layer():
-    rt = _image_runtime(scene=Scene())
-    _feed_draw(rt, [(0.5, 0.5)])  # single point -> not a stroke
-    rt._advance_drawing([_idle(), _idle()], FRAME_SIZE)
-    assert rt._stroke is None
+    rt.toggle_draw_mode()
+    rt.toggle_draw_mode()  # entered and left without drawing
     assert len(rt.scene.layers) == 0
 
 
-def test_hand_loss_freezes_active_stroke():
-    # A tracking dropout publishes NO gesture states at all; the in-progress
-    # stroke must freeze into a layer rather than dangle (or crash on the
-    # missing primary hand).
+def test_freeze_carries_pen_color_and_width():
     rt = _image_runtime(scene=Scene())
-    _feed_draw(rt, [(0.2, 0.2), (0.3, 0.3), (0.4, 0.4)])
-    rt._advance_drawing([], FRAME_SIZE)
-    assert rt._stroke is None
-    assert len(rt.scene.layers) == 1
-
-
-def test_release_resets_interaction_so_new_layer_is_not_auto_grabbed():
-    from src.interaction import GrabState
-    grabbed = InteractionState(grab=GrabState(is_grabbed=True, was_pinching=True))
-    rt = _image_runtime(scene=Scene(), interaction=grabbed)
-    _feed_draw(rt, [(0.4, 0.4), (0.5, 0.5), (0.6, 0.6)])
-    rt._advance_drawing([_idle(), _idle()], FRAME_SIZE)
-    assert rt.interaction.grab.is_grabbed is False
-
-
-# --------------------------------------------------------------------------- #
-# clear_stroke: discard the in-progress stroke without freezing
-# --------------------------------------------------------------------------- #
-
-def test_clear_stroke_discards_without_freezing():
-    rt = _image_runtime(scene=Scene())
-    _feed_draw(rt, [(0.3, 0.3), (0.4, 0.4)])
-    assert rt._stroke is not None
-    rt.clear_stroke()
-    assert rt._stroke is None
-    assert len(rt.scene.layers) == 0  # nothing frozen
-
-
-def test_drawing_keys_inert_in_skeleton_mode():
-    args = parse_args(["--mode", "skeleton"])
-    rt = PipelineRuntime(
-        args, _FakePacketWebcam(), None, Scene(), InteractionState.initial(), None, None
-    )
-    assert rt._handle_keys(CYCLE_COLOR_KEY) is True
-    assert rt._stroke_color_index == 0  # 'k' gated to image mode
-    rt._stroke = Stroke().append((0.1, 0.1))
-    assert rt._handle_keys(CLEAR_STROKE_KEY) is True
-    assert rt._stroke is not None  # 'c' gated to image mode
-
-
-# --------------------------------------------------------------------------- #
-# Gesture precedence: suppress_draw_pinch (standalone + through step)
-# --------------------------------------------------------------------------- #
-
-def test_suppress_draw_pinch_masks_pinch_only_for_drawing_hand():
-    drawing_hand = GestureState(
-        is_pinching=True, pinch_point=(0.5, 0.5), is_grab=False,
-        is_draw=True, draw_point=(0.5, 0.5),
-    )
-    normal_hand = GestureState(is_pinching=True, pinch_point=(0.2, 0.2), is_grab=False)
-    out = suppress_draw_pinch([drawing_hand, normal_hand])
-    # Drawing hand: pinch masked off, but point/draw flag preserved.
-    assert out[0].is_pinching is False
-    assert out[0].pinch_point == (0.5, 0.5)
-    assert out[0].is_draw is True
-    # Non-drawing hand: passed through untouched.
-    assert out[1] is normal_hand
-    assert out[1].is_pinching is True
-
-
-def test_suppress_draw_pinch_does_not_mutate_inputs():
-    drawing_hand = GestureState(
-        is_pinching=True, pinch_point=(0.5, 0.5), is_grab=False, is_draw=True
-    )
-    suppress_draw_pinch([drawing_hand])
-    assert drawing_hand.is_pinching is True  # original frozen state unchanged
-
-
-def test_drawing_hand_pinch_does_not_grab_but_a_real_pinch_does():
-    scene = Scene.single(Layer(source=_FakeSource((20, 20)), transform=Transform()))
-    idle = _idle()
-    # Drawing + (spuriously) pinching over the layer: suppression blocks the grab.
-    draw_pinch = GestureState(
-        is_pinching=True, pinch_point=(0.5, 0.5), is_grab=False,
-        is_draw=True, draw_point=(0.5, 0.5),
-    )
-    i, _s = step(
-        InteractionState.initial(), scene, suppress_draw_pinch([draw_pinch, idle]), FRAME_SIZE
-    )
-    assert i.grab.is_grabbed is False
-    # Control: the identical pinch WITHOUT drawing does grab the layer.
-    real_pinch = GestureState(is_pinching=True, pinch_point=(0.5, 0.5), is_grab=False)
-    i2, _s2 = step(
-        InteractionState.initial(), scene, suppress_draw_pinch([real_pinch, idle]), FRAME_SIZE
-    )
-    assert i2.grab.is_grabbed is True
-
-
-# --------------------------------------------------------------------------- #
-# Drawing keys: clear (c), cycle color (k), width down/up ([ / ])
-# --------------------------------------------------------------------------- #
-
-def test_drawing_key_clear_discards_stroke():
-    rt = _image_runtime()
-    rt._stroke = Stroke().append((0.1, 0.1)).append((0.2, 0.2))
-    rt._handle_drawing_key(CLEAR_STROKE_KEY)
-    assert rt._stroke is None
-
-
-def test_drawing_key_cycle_color_advances_palette():
-    rt = _image_runtime()
-    assert rt._stroke_color_index == 0
-    rt._handle_drawing_key(CYCLE_COLOR_KEY)
-    assert rt._stroke_color_index == 1
-    assert rt._stroke_color() == STROKE_PALETTE[1]
-
-
-def test_drawing_key_width_up_and_down_are_clamped():
-    rt = _image_runtime()
-    assert rt._stroke_width == DEFAULT_STROKE_WIDTH
+    rt.toggle_draw_mode()
+    rt._handle_drawing_key(CYCLE_COLOR_KEY)  # color index -> 1
     rt._handle_drawing_key(STROKE_WIDTH_UP_KEY)
-    assert rt._stroke_width == DEFAULT_STROKE_WIDTH + STROKE_WIDTH_STEP
-    # Hammer it down past the floor -> clamps at MIN.
+    for p in [(0.4, 0.4), (0.5, 0.5)]:
+        _advance(rt, [_pinch(p)])
+    rt.toggle_draw_mode()  # freeze
+    assert rt._draw.color_index == 1  # pen settings carried over
+    assert rt._draw.width == DEFAULT_STROKE_WIDTH + STROKE_WIDTH_STEP
+
+
+# --------------------------------------------------------------------------- #
+# Draw keys (only act while in draw mode)
+# --------------------------------------------------------------------------- #
+
+def test_clear_discards_current_strokes_in_draw_mode():
+    rt = _image_runtime()
+    rt.toggle_draw_mode()
+    _advance(rt, [_pinch((0.3, 0.3))])
+    _advance(rt, [_pinch((0.4, 0.4))])
+    rt._handle_drawing_key(CLEAR_STROKE_KEY)
+    assert rt._draw.is_empty is True
+
+
+def test_color_and_width_keys_inert_outside_draw_mode():
+    rt = _image_runtime()  # NOT in draw mode
+    rt._handle_drawing_key(CYCLE_COLOR_KEY)
+    rt._handle_drawing_key(STROKE_WIDTH_UP_KEY)
+    assert rt._draw.color_index == 0
+    assert rt._draw.width == DEFAULT_STROKE_WIDTH
+
+
+def test_width_keys_clamp_in_draw_mode():
+    rt = _image_runtime()
+    rt.toggle_draw_mode()
     for _ in range(50):
         rt._handle_drawing_key(STROKE_WIDTH_DOWN_KEY)
-    assert rt._stroke_width == MIN_STROKE_WIDTH
-    # Hammer it up past the ceiling -> clamps at MAX.
+    assert rt._draw.width == MIN_STROKE_WIDTH
     for _ in range(50):
         rt._handle_drawing_key(STROKE_WIDTH_UP_KEY)
-    assert rt._stroke_width == MAX_STROKE_WIDTH
+    assert rt._draw.width == MAX_STROKE_WIDTH
 
 
-def test_drawing_key_other_key_is_a_noop():
-    rt = _image_runtime()
-    rt._stroke = Stroke().append((0.1, 0.1))
-    rt._handle_drawing_key(ord("z"))
-    assert rt._stroke is not None
-    assert rt._stroke_color_index == 0
-    assert rt._stroke_width == DEFAULT_STROKE_WIDTH
+# --------------------------------------------------------------------------- #
+# Draw mode suppresses grabbing (pinch owns the pen, not the scene)
+# --------------------------------------------------------------------------- #
+
+def test_pinch_in_draw_mode_does_not_grab_a_layer():
+    rt = _image_runtime(scene=_layer_scene())
+    rt.toggle_draw_mode()
+    _advance(rt, [_pinch((0.5, 0.5))])  # over the layer, but drawing
+    assert rt.interaction.grab.is_grabbed is False  # pinch inked, didn't grab
+    assert rt._draw.current == ((0.5, 0.5),)
 
 
-def test_handle_keys_routes_clear_in_image_mode():
-    rt = _image_runtime()
-    rt._stroke = Stroke().append((0.1, 0.1)).append((0.2, 0.2))
-    assert rt._handle_keys(CLEAR_STROKE_KEY) is True  # not a quit
-    assert rt._stroke is None
+def test_pinch_grabs_layer_when_not_drawing():
+    # Control: the SAME pinch grabs the layer with draw mode off (regression fixed).
+    rt = _image_runtime(scene=_layer_scene())
+    _advance(rt, [_pinch((0.5, 0.5))])
+    assert rt.interaction.grab.is_grabbed is True
 
 
-def test_draw_active_stroke_overlay_marks_the_frame():
-    rt = _image_runtime()
-    rt._stroke = Stroke().append((0.2, 0.5)).append((0.8, 0.5))
-    frame = np.zeros((60, 60, 3), dtype=np.uint8)
-    rt._draw_active_stroke(frame)
-    assert frame.sum() > 0  # the live polyline + cursor were drawn
+# --------------------------------------------------------------------------- #
+# Fist-to-remove gesture
+# --------------------------------------------------------------------------- #
+
+def test_fist_removal_target_hits_layer_under_fist():
+    scene = _layer_scene()
+    assert fist_removal_target(scene, [_fist((0.5, 0.5))], FRAME_SIZE) == 0
+    assert fist_removal_target(scene, [_fist((0.05, 0.05))], FRAME_SIZE) is None  # off the layer
+
+
+def test_fist_removal_target_ignores_a_pinching_hand():
+    # A pinch-grab-move (fingers may curl) must not read as a remove fist.
+    scene = _layer_scene()
+    pinch_and_grab = GestureState(
+        is_pinching=True, pinch_point=(0.5, 0.5), is_grab=True, grab_point=(0.5, 0.5)
+    )
+    assert fist_removal_target(scene, [pinch_and_grab], FRAME_SIZE) is None
+
+
+def test_held_fist_removes_the_layer_after_threshold():
+    rt = _image_runtime(scene=_layer_scene())
+    for _ in range(FIST_REMOVE_FRAMES - 1):
+        _advance(rt, [_fist((0.5, 0.5))])
+    assert len(rt.scene.layers) == 1  # not yet -- still counting the hold
+    _advance(rt, [_fist((0.5, 0.5))])  # crosses the threshold
+    assert len(rt.scene.layers) == 0  # removed
+
+
+def test_momentary_fist_does_not_remove():
+    rt = _image_runtime(scene=_layer_scene())
+    _advance(rt, [_fist((0.5, 0.5))])   # one frame
+    _advance(rt, [_idle()])             # fist lifted -> counter resets
+    for _ in range(FIST_REMOVE_FRAMES - 1):
+        _advance(rt, [_fist((0.5, 0.5))])
+    assert len(rt.scene.layers) == 1  # the reset means the threshold isn't reached
+
+
+def test_fist_over_empty_space_removes_nothing():
+    rt = _image_runtime(scene=_layer_scene())
+    for _ in range(FIST_REMOVE_FRAMES + 2):
+        _advance(rt, [_fist((0.02, 0.02))])  # nowhere near the layer
+    assert len(rt.scene.layers) == 1

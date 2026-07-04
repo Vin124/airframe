@@ -16,6 +16,7 @@ from src.tuning import DEFAULT_PINCH_ENTER, DEFAULT_PINCH_EXIT
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+MIDDLE_MCP = 9   # middle-finger base knuckle -- a stable palm-center proxy
 MIDDLE_TIP = 12
 RING_TIP = 16
 PINKY_TIP = 20
@@ -35,23 +36,6 @@ _CURL_FINGER_TIPS = (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
 # A fist rarely curls all four fingers with perfect symmetry (tracking noise,
 # thumb occlusion, etc.), so require a majority rather than unanimity.
 _MIN_CURLED_FINGERS_FOR_GRAB = 3
-
-# Draw pose (Phase 11 air-drawing): index finger EXTENDED while middle/ring/
-# pinky are CURLED -- the classic "pointing" pose. Same wrist-distance test as
-# the grab heuristic: a fingertip is "extended" when it's farther from the wrist
-# than its PIP joint, "curled" when it's closer. The three non-index fingers are
-# checked with a majority (2 of 3), tolerating one noisy finger the same way
-# grab tolerates a partially-open pinky -- otherwise tracking jitter on a single
-# finger would drop the pose mid-stroke.
-_DRAW_CURLED_TIPS = (MIDDLE_TIP, RING_TIP, PINKY_TIP)
-_DRAW_CURLED_PIPS = (MIDDLE_PIP, RING_PIP, PINKY_PIP)
-_MIN_CURLED_FINGERS_FOR_DRAW = 2
-
-# Draw-pose hysteresis: an N-consecutive-frame confirmation debounce. The latched
-# ``is_draw`` state only flips after the raw per-frame pose disagrees with it for
-# this many frames in a row, so a single mis-detected frame can't start or break
-# a stroke (the air-drawing equivalent of the pinch enter/exit gap).
-_DRAW_CONFIRM_FRAMES = 3
 
 # Pinch thresholds, normalized Euclidean distance (x, y only -- z is noisy
 # depth from MediaPipe and not reliable enough to include here).
@@ -100,19 +84,17 @@ Point2D = Tuple[float, float]
 class GestureState:
     """Immutable per-frame gesture result for one tracked hand.
 
-    ``is_draw`` (Phase 11) is the debounced air-drawing pose latch and
-    ``draw_point`` is the index fingertip (landmark 8) in normalized coords --
-    computed HERE on the tracking thread so the main loop only reads the
-    published values and never derives a gesture from raw landmarks itself. Both
-    default to the no-draw values so the three-field keyword constructors used
-    elsewhere (``src.tracking``) keep working unchanged.
+    ``grab_point`` is the palm center (middle-finger MCP, landmark 9) in
+    normalized coords -- computed HERE on the tracking thread so the main loop
+    only reads published values and never derives a gesture from raw landmarks.
+    It locates a fist for the fist-to-remove gesture; it defaults to the origin
+    so the three-field keyword constructors used elsewhere keep working.
     """
 
     is_pinching: bool
     pinch_point: Point2D
     is_grab: bool
-    is_draw: bool = False
-    draw_point: Point2D = (0.0, 0.0)
+    grab_point: Point2D = (0.0, 0.0)
 
 
 # Returned when there is no hand to analyze this frame.
@@ -154,42 +136,6 @@ def detect_grab(hand: Hand) -> bool:
     return curled_count >= _MIN_CURLED_FINGERS_FOR_GRAB
 
 
-def _dist_to_wrist(hand: Hand, idx: int) -> float:
-    """Planar (x, y) distance from landmark ``idx`` to the wrist (ignores z)."""
-    wx, wy, _wz = hand[WRIST]
-    x, y, _z = hand[idx]
-    return hypot(x - wx, y - wy)
-
-
-def _finger_extended(hand: Hand, tip_idx: int, pip_idx: int) -> bool:
-    """True when the fingertip sits farther from the wrist than its PIP joint."""
-    return _dist_to_wrist(hand, tip_idx) > _dist_to_wrist(hand, pip_idx)
-
-
-def _finger_curled(hand: Hand, tip_idx: int, pip_idx: int) -> bool:
-    """True when the fingertip sits closer to the wrist than its PIP joint."""
-    return _dist_to_wrist(hand, tip_idx) < _dist_to_wrist(hand, pip_idx)
-
-
-def detect_draw_pose(hand: Hand) -> bool:
-    """Raw per-frame air-drawing pose: index extended, others mostly curled.
-
-    The "pointing" pose used to draw: the index finger is extended (tip beyond
-    its PIP joint) while a majority of middle/ring/pinky are curled back toward
-    the palm. Pure geometry on one frame's landmarks -- the frame-to-frame
-    debounce that stops flicker lives in ``GestureDetector`` (see
-    ``_DRAW_CONFIRM_FRAMES``). An open hand fails (nothing curled); a fist fails
-    (the index is curled too), so this cleanly separates draw from grab/open.
-    """
-    if not _finger_extended(hand, INDEX_TIP, INDEX_PIP):
-        return False
-    curled = sum(
-        _finger_curled(hand, tip_idx, pip_idx)
-        for tip_idx, pip_idx in zip(_DRAW_CURLED_TIPS, _DRAW_CURLED_PIPS)
-    )
-    return curled >= _MIN_CURLED_FINGERS_FOR_DRAW
-
-
 class GestureDetector:
     """Tracks pinch hysteresis state across frames for one hand.
 
@@ -212,11 +158,6 @@ class GestureDetector:
         self._is_pinching = False
         self._enter_threshold = enter_threshold
         self._exit_threshold = exit_threshold
-        # Air-drawing pose latch + its confirmation streak (frames the raw pose
-        # has disagreed with the latch in a row). Owned by this detector, same
-        # single-owner discipline as the pinch latch above.
-        self._is_drawing = False
-        self._draw_streak = 0
 
     def set_thresholds(self, enter_threshold: float, exit_threshold: float) -> None:
         """Swap in new pinch thresholds (owning tracking thread only).
@@ -240,18 +181,11 @@ class GestureDetector:
         """
         if hand is None:
             self._is_pinching = False
-            # Hard-reset the draw latch on hand loss (like pinch): no hand means
-            # no evidence a stroke is still happening, and holding a stale
-            # ``is_draw`` would keep extending a stroke through a tracking
-            # dropout. The confirmation streak resets too.
-            self._is_drawing = False
-            self._draw_streak = 0
             return GestureState(
                 is_pinching=False,
                 pinch_point=_NO_HAND_PINCH_POINT,
                 is_grab=False,
-                is_draw=False,
-                draw_point=_NO_HAND_PINCH_POINT,
+                grab_point=_NO_HAND_PINCH_POINT,
             )
 
         distance, midpoint = pinch_distance_and_midpoint(hand)
@@ -261,31 +195,11 @@ class GestureDetector:
         else:
             self._is_pinching = distance < self._enter_threshold
 
-        is_drawing = self._update_draw_latch(hand)
-        ix, iy, _iz = hand[INDEX_TIP]
+        px, py, _pz = hand[MIDDLE_MCP]  # palm center, for the fist-to-remove gesture
 
         return GestureState(
             is_pinching=self._is_pinching,
             pinch_point=midpoint,
             is_grab=detect_grab(hand),
-            is_draw=is_drawing,
-            draw_point=(ix, iy),
+            grab_point=(px, py),
         )
-
-    def _update_draw_latch(self, hand: Hand) -> bool:
-        """Advance the N-consecutive-frame draw-pose debounce; return the latch.
-
-        The raw pose (``detect_draw_pose``) must disagree with the current latch
-        for ``_DRAW_CONFIRM_FRAMES`` frames in a row before the latch flips, so a
-        lone mis-detected frame neither starts nor ends a stroke. A frame that
-        agrees with the latch resets the streak.
-        """
-        raw = detect_draw_pose(hand)
-        if raw == self._is_drawing:
-            self._draw_streak = 0
-        else:
-            self._draw_streak += 1
-            if self._draw_streak >= _DRAW_CONFIRM_FRAMES:
-                self._is_drawing = raw
-                self._draw_streak = 0
-        return self._is_drawing

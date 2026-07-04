@@ -9,46 +9,81 @@ from src.drawing import (
     MAX_STROKE_WIDTH,
     MIN_STROKE_WIDTH,
     STROKE_PALETTE,
-    Stroke,
+    DrawState,
     bbox_to_transform,
     clamped_width,
     draw_cursor,
+    draw_live_state,
     draw_stroke_overlay,
+    freeze_draw_state,
     next_color_index,
     rasterize_stroke,
+    rasterize_strokes,
     smooth_points,
 )
 from src.scene import DEFAULT_SCALE, top_left_px
 
 
 # --------------------------------------------------------------------------- #
-# Stroke model (immutable + functional append)
+# DrawState model (immutable + functional pen transitions)
 # --------------------------------------------------------------------------- #
 
-def test_stroke_defaults_empty():
-    stroke = Stroke()
-    assert stroke.is_empty is True
-    assert len(stroke) == 0
+def test_draw_state_defaults_empty_and_off():
+    state = DrawState()
+    assert state.mode is False
+    assert state.is_empty is True
+    assert state.all_strokes == ()
 
 
-def test_stroke_append_returns_new_stroke_without_mutating():
-    original = Stroke()
-    appended = original.append((0.1, 0.2))
-    assert original.points == ()  # unchanged
-    assert appended.points == ((0.1, 0.2),)
-    assert len(appended) == 1
+def test_pen_move_appends_without_mutating():
+    original = DrawState()
+    moved = original.pen_move((0.1, 0.2))
+    assert original.current == ()  # unchanged
+    assert moved.current == ((0.1, 0.2),)
 
 
-def test_stroke_append_chains_points_in_order():
-    stroke = Stroke().append((0.1, 0.2)).append((0.3, 0.4))
-    assert stroke.points == ((0.1, 0.2), (0.3, 0.4))
-    assert len(stroke) == 2
+def test_pen_move_coerces_to_float():
+    state = DrawState().pen_move((1, 0))
+    assert state.current == ((1.0, 0.0),)
+    assert isinstance(state.current[0][0], float)
 
 
-def test_stroke_append_coerces_to_float():
-    stroke = Stroke().append((1, 0))  # ints in
-    assert stroke.points == ((1.0, 0.0),)
-    assert isinstance(stroke.points[0][0], float)
+def test_pen_up_banks_a_real_stroke():
+    state = DrawState().pen_move((0.1, 0.1)).pen_move((0.2, 0.2)).pen_up()
+    assert state.segments == (((0.1, 0.1), (0.2, 0.2)),)
+    assert state.current == ()  # ready for the next stroke
+
+
+def test_pen_up_discards_a_tap():
+    # A single-point "tap" (< MIN_STROKE_POINTS) is not banked.
+    state = DrawState().pen_move((0.1, 0.1)).pen_up()
+    assert state.segments == ()
+    assert state.current == ()
+
+
+def test_all_strokes_includes_current():
+    state = DrawState().pen_move((0.1, 0.1)).pen_move((0.2, 0.2)).pen_up().pen_move((0.5, 0.5))
+    assert len(state.all_strokes) == 2  # one banked segment + the in-progress one
+
+
+def test_cleared_drops_everything():
+    state = DrawState().pen_move((0.1, 0.1)).pen_move((0.2, 0.2)).pen_up().pen_move((0.5, 0.5))
+    cleared = state.cleared()
+    assert cleared.is_empty is True
+
+
+def test_with_mode_toggles_without_mutating():
+    original = DrawState()
+    assert original.with_mode(True).mode is True
+    assert original.mode is False
+
+
+def test_color_and_width_transitions():
+    state = DrawState()
+    assert state.with_next_color().color_index == 1
+    assert state.with_width_delta(-1000).width == MIN_STROKE_WIDTH
+    assert state.with_width_delta(1000).width == MAX_STROKE_WIDTH
+    assert state.color == STROKE_PALETTE[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -201,3 +236,66 @@ def test_draw_cursor_marks_pixels():
     frame = np.zeros((50, 50, 3), dtype=np.uint8)
     draw_cursor(frame, (0.5, 0.5), (255, 255, 255))
     assert frame.sum() > 0
+
+
+# --------------------------------------------------------------------------- #
+# Multi-stroke: rasterize_strokes + freeze_draw_state + draw_live_state
+# --------------------------------------------------------------------------- #
+
+def test_rasterize_strokes_combined_bbox_covers_all_strokes():
+    strokes = (((0.1, 0.1), (0.2, 0.2)), ((0.7, 0.7), (0.8, 0.8)))
+    result = rasterize_strokes(strokes, (100, 100), (0, 0, 255), width=4, padding=2)
+    assert result is not None
+    bgra, (x0, y0, w, h) = result
+    # The bbox must span from near the first stroke's min to the last's max.
+    assert x0 < 10 and y0 < 10
+    assert x0 + w > 80 and y0 + h > 80
+    assert bgra[:, :, 3].max() > 0  # both strokes drew ink
+
+
+def test_rasterize_strokes_empty_returns_none():
+    assert rasterize_strokes((), (100, 100), (0, 0, 255), width=4) is None
+    assert rasterize_strokes(((),), (100, 100), (0, 0, 255), width=4) is None
+
+
+def test_freeze_draw_state_two_strokes_into_one_layer():
+    state = (
+        DrawState()
+        .pen_move((0.2, 0.2)).pen_move((0.3, 0.3)).pen_up()
+        .pen_move((0.6, 0.6)).pen_move((0.7, 0.7))
+    )
+    frozen = freeze_draw_state(state, (100, 100))
+    assert frozen is not None
+    bgra, transform = frozen
+    assert bgra.shape[2] == 4  # BGRA
+    assert transform.scale == DEFAULT_SCALE
+    # Center sits between the two strokes' combined extent.
+    assert 0.3 < transform.center_x < 0.7
+
+
+def test_freeze_draw_state_nothing_drawn_is_none():
+    assert freeze_draw_state(DrawState(), (100, 100)) is None
+    # A lone tap (below MIN_STROKE_POINTS) also yields nothing to freeze.
+    assert freeze_draw_state(DrawState().pen_move((0.5, 0.5)), (100, 100)) is None
+
+
+def test_freeze_draw_state_round_trips_placement():
+    # The frozen layer lands where it was drawn (same guarantee as bbox_to_transform).
+    state = DrawState().pen_move((0.4, 0.4)).pen_move((0.6, 0.6))
+    frozen = freeze_draw_state(state, (100, 100))
+    assert frozen is not None
+    bgra, transform = frozen
+    h, w = bgra.shape[:2]
+    x0, y0 = top_left_px(transform, (w, h), (100, 100))
+    # The drawn points (40..60 px) sit inside the placed layer's rect.
+    assert x0 <= 40 and y0 <= 40
+    assert x0 + w >= 60 and y0 + h >= 60
+
+
+def test_draw_live_state_marks_frame_and_empty_is_noop():
+    frame = np.zeros((50, 50, 3), dtype=np.uint8)
+    draw_live_state(frame, DrawState())  # nothing drawn
+    assert frame.sum() == 0
+    active = DrawState().pen_move((0.2, 0.5)).pen_move((0.8, 0.5))
+    draw_live_state(frame, active)
+    assert frame.sum() > 0  # ink + cursor

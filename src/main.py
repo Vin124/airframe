@@ -3,12 +3,11 @@
 The app is a small pipeline: a webcam ``Source`` produces the background frame, a
 ``Scene`` of ``Layer`` objects is composited over it, and the result goes to a
 preview ``Sink``. Hand tracking + gesture detection drive interaction on the
-selected layer. Skeleton mode draws a 21-point skeleton over an empty scene;
-image mode starts with one overlay layer you pinch-grab/move/resize, add to
-('a'/'w'/'m'), remove ('x'), or raise ('f'). Both mirror the feed, draw a HUD,
-print FPS, quit on 'q', and can broadcast to a virtual cam (``--virtualcam`` /
-'v'). The scene/source-layer transitions live in ``src.layers`` and the launch
-glue in ``src.launch``; both are re-exported below for the test import surface.
+selected layer. Skeleton mode draws a 21-point skeleton; image mode adds overlay
+layers you pinch-grab/move/resize/add/remove/raise, air-draw (draw mode), and
+fist-remove. Both mirror the feed, draw a HUD, print FPS, quit on 'q', and can
+broadcast to a virtual cam. Scene/source-layer transitions live in ``src.layers``
+and the launch glue in ``src.launch``; both re-exported below for the tests.
 """
 
 import argparse
@@ -20,8 +19,9 @@ import cv2
 import numpy as np
 
 from src import compositor, config, drawing, hud
-from src.drawing import (  # air-drawing keys (Phase 11), re-exported for tests
-    CLEAR_STROKE_KEY, CYCLE_COLOR_KEY, STROKE_WIDTH_DOWN_KEY, STROKE_WIDTH_UP_KEY,
+from src.drawing import (  # air-drawing keys, re-exported for tests
+    CLEAR_STROKE_KEY, CYCLE_COLOR_KEY, DRAW_MODE_KEY,
+    STROKE_WIDTH_DOWN_KEY, STROKE_WIDTH_UP_KEY,
 )
 from src.camera import CameraError
 from src.fps import FpsCounter
@@ -91,7 +91,7 @@ from src.layers import (  # noqa: F401  (re-exported for tests / used below)
     _monitor_source_from_index,
     _remove_selected_layer,
     _window_source_from_title,
-    suppress_draw_pinch,
+    fist_removal_target,
 )
 from src.launch import (  # noqa: F401  (re-exported for tests / used below)
     _build_panel,
@@ -123,6 +123,10 @@ TARGET_FPS = 30
 # Number of hands to track in image mode (single hand grabs/moves; two hands
 # pinch-resize).
 IMAGE_MODE_NUM_HANDS = 2
+
+# Consecutive main-loop ticks a fist must be held over a layer before it's
+# removed (~0.4 s at TARGET_FPS) -- a deliberate hold, not a momentary fist.
+FIST_REMOVE_FRAMES = 12
 
 # Keyboard scaling in image mode. '+' usually needs shift, so accept its
 # unshifted twin '='; likewise '-' and '_'. One key press multiplies the scale
@@ -171,11 +175,9 @@ def _pump_virtualcam(
 ) -> Tuple[bool, bool]:
     """Send ``frame`` to the virtual cam when active; degrade gracefully on failure.
 
-    Returns the updated ``(active, ever_sent)`` pair. A ``SinkError`` on the
-    very first launch-requested send is fatal (``exit(1)``, matching
-    ``_init_mode``'s fail-fast-before-real-work behavior); any later failure --
-    or a failure of a runtime 'v' toggle that was never requested at launch --
-    prints to stderr and turns the toggle off, keeping the live session alive.
+    Returns the updated ``(active, ever_sent)`` pair. A ``SinkError`` on the very
+    first launch-requested send is fatal (``exit(1)``); any later failure -- or a
+    runtime 'v' toggle never requested at launch -- warns and turns the toggle off.
     """
     if not active:
         return active, ever_sent
@@ -194,11 +196,9 @@ def _handle_image_key(
 ) -> Tuple[Scene, InteractionState]:
     """Apply the image-mode-only keys: '+/-' scale and 'r' transform reset.
 
-    Scaling multiplies the selected layer's transform. Reset recenters the
-    selected layer AND idles grab/resize (returns a fresh ``InteractionState``)
-    rather than just the transform, so a reset mid-grab can't leave a stale grab
-    offset that would otherwise yank the image back out of center on the next
-    tracked frame. No-op (returns the inputs) when nothing is selected.
+    Scaling multiplies the selected layer's transform. Reset recenters it AND
+    idles grab/resize (a fresh ``InteractionState``) so a reset mid-grab can't
+    leave a stale offset. No-op when nothing is selected.
     """
     layer = scene.selected_layer
     if layer is None:
@@ -305,7 +305,9 @@ class PipelineRuntime:
         self.tuning = tuning if tuning is not None else GestureTuning(
             PINCH_ENTER_THRESHOLD, PINCH_EXIT_THRESHOLD
         )
-        self.show_skeleton = True if args.mode == MODE_SKELETON else args.debug_skeleton
+        # Skeleton overlay defaults ON in both modes during development (toggle
+        # with 's'); --debug-skeleton is kept for parity but no longer needed.
+        self.show_skeleton = args.mode == MODE_SKELETON or args.mode == MODE_IMAGE or args.debug_skeleton
         # Initial virtual-cam state: resolved CLI-or-config value. The fatal-on-
         # first-failure check in _pump_virtualcam still keys off args.virtualcam, so
         # a config-driven ON degrades gracefully like a runtime 'v' toggle.
@@ -320,12 +322,14 @@ class PipelineRuntime:
         self._panel_status: Optional[str] = None  # last panel-action message
         self._panel = None  # optional Tk ControlPanel, pumped once per tick
         self._timings = StageTimings()
-        # Air-drawing state (Phase 11), owned solely by this main loop. ``_stroke``
-        # is the in-progress path (None between strokes); color/width are the pen
-        # settings driven by the c/k/[/] keys and baked in when a stroke freezes.
-        self._stroke: Optional[drawing.Stroke] = None
-        self._stroke_color_index = 0
-        self._stroke_width = drawing.DEFAULT_STROKE_WIDTH
+        # Air-drawing (main-loop-owned): draw mode + pen strokes + color/width
+        # (drawing.DrawState). In draw mode a pinch inks; toggling off freezes it.
+        self._draw = drawing.DrawState()
+        self._draw_was_pinching = False  # pinch edge for pen up/down
+        # Fist-to-remove hold: the layer index a fist is over + its held-frames.
+        self._fist_index: Optional[int] = None
+        self._fist_streak = 0
+        self._frame_size: Tuple[int, int] = (0, 0)  # last frame size (freeze on 'd')
 
     def run(self) -> None:
         """Loop until 'q' (or the window is closed), pacing each tick to TARGET_FPS."""
@@ -360,9 +364,8 @@ class PipelineRuntime:
         time.sleep(remaining_sleep_seconds(TARGET_FPS, elapsed))
         self._update_timings(tracking, composite_ms, sink_ms, elapsed * 1000.0)
         keep = self._handle_keys(key)
-        # Pump the Tk panel last: its button callbacks run inline here on the main
-        # thread and call this runtime's add/reset/toggle methods, so scene edits
-        # land between frames with the main loop still the single writer.
+        # Pump the Tk panel last: its callbacks run inline on the main thread and
+        # call this runtime's methods, so scene edits keep the single-writer rule.
         self._pump_panel()
         return keep
 
@@ -371,8 +374,8 @@ class PipelineRuntime:
 
         The capture thread publishes each frame as a shared, READ-ONLY array; the
         compositor draws in place, so we hand back a private per-frame COPY every
-        tick (adopting a new clean frame only on a new sequence, reusing the last
-        one otherwise). ``None`` only before the very first frame arrives.
+        tick (adopting a new clean frame only on a new sequence). ``None`` only
+        before the very first frame arrives.
         """
         packet = self._webcam.latest_packet()
         if packet is not None and packet[0] != self._clean_seq:
@@ -383,70 +386,78 @@ class PipelineRuntime:
         return self._clean_frame.copy()
 
     def _advance_scene(self, tracking: TrackingResult, frame_size: Tuple[int, int]) -> None:
-        """Apply the one-time live-layer fit + advance interaction (image mode only).
+        """Advance drawing OR interaction (image mode only); single scene writer.
 
-        Single writer of scene/interaction (main thread). Runs the initial fit
-        BEFORE ``step``; drawing + spawn also run before it (each may add a layer
-        and mask a hand's pinch from ``step``). Skeleton mode just clears status.
+        Draw mode and normal mode are exclusive: in DRAW MODE a pinch is the pen
+        (interaction/spawn/fist inert, so a pinch can't also grab); in NORMAL mode
+        a pinch grabs/moves, a spawn-preview drag takes pinch precedence, and a
+        fist held over a layer removes it. Skeleton mode just clears the status.
         """
         if self._args.mode != MODE_IMAGE:
             self._status = None
             return
+        self._frame_size = frame_size
         self.scene, self._fit_ids = _apply_pending_fit(self.scene, self._fit_ids, frame_size)
         gesture_states = list(tracking.gesture_states)
-        # Air-drawing (reads is_draw off the raw states) may freeze a stroke layer.
-        self._advance_drawing(gesture_states, frame_size)
-        # Suppress a drawing hand's pinch ONCE, feed it to BOTH spawn and step, so a
-        # draw pose grabs neither the docked preview nor a scene layer. Spawn runs
-        # before interaction; a pinch dragging the preview is masked from step too.
-        undrawn = suppress_draw_pinch(gesture_states)
-        grabbing = self._advance_spawn(undrawn, frame_size)
-        gestures = suppress_spawn_pinch(undrawn, grabbing)
+        primary = gesture_states[0] if gesture_states else None
+        if self._draw.mode:
+            self._advance_pen(primary)
+            self._status = "DRAW MODE (pinch=pen, d=finish)"
+            return
+        grabbing = self._advance_spawn(gesture_states, frame_size)
+        gestures = suppress_spawn_pinch(gesture_states, grabbing)
         self.interaction, self.scene = step(
             self.interaction, self.scene, gestures, frame_size
         )
+        self._advance_fist_removal(gesture_states, frame_size)
         self._status = hud.resize_or_grab_status(
             self.interaction.grab.is_grabbed, self.interaction.resize.is_resizing
         )
 
-    def _advance_drawing(
-        self, gesture_states: list, frame_size: Tuple[int, int]
-    ) -> None:
-        """Append to / release the air-drawing stroke from the primary hand.
+    def _advance_pen(self, primary: Optional[GestureState]) -> None:
+        """Pinch-to-ink in draw mode: ink while pinching, bank the stroke on release
+        (reads only the published pinch, never raw landmarks)."""
+        pinching = bool(primary is not None and primary.is_pinching)
+        if pinching:
+            self._draw = self._draw.pen_move(primary.pinch_point)
+        elif self._draw_was_pinching:
+            self._draw = self._draw.pen_up()
+        self._draw_was_pinching = pinching
 
-        Single writer of the stroke (main thread): appends the published
-        index-fingertip point while ``is_draw`` holds, and freezes the stroke
-        into a scene layer the frame the pose releases. Reads only the tracking
-        thread's published gesture state -- never raw landmarks.
-        """
-        primary = gesture_states[0] if gesture_states else None
-        if primary is not None and getattr(primary, "is_draw", False):
-            active = self._stroke if self._stroke is not None else drawing.Stroke()
-            self._stroke = active.append(primary.draw_point)
-        elif self._stroke is not None:
-            self._freeze_stroke(frame_size)
-
-    def _freeze_stroke(self, frame_size: Tuple[int, int]) -> None:
-        """Rasterize the released stroke into a new, grabbable scene layer.
-
-        ``drawing.freeze_stroke`` does the pure smooth -> rasterize -> place math
-        (``None`` for a too-short tap); the result is added via ``Scene.add_layer``
-        (top, selected, stable id) and interaction is reset so no stale pinch edge
-        grabs the new layer.
-        """
-        stroke = self._stroke
-        self._stroke = None
-        if stroke is None:
+    def _freeze_draw(self) -> None:
+        """Freeze the drawn strokes into one scene layer (on toggling draw mode off);
+        pen color/width carry over, interaction resets so no stale pinch grabs it."""
+        state = self._draw.pen_up()
+        self._draw = drawing.DrawState(color_index=state.color_index, width=state.width)
+        self._draw_was_pinching = False
+        if self._frame_size[0] == 0:  # no frame seen yet -> nothing placeable
             return
-        frozen = drawing.freeze_stroke(
-            stroke.points, frame_size, self._stroke_color(), self._stroke_width
-        )
+        frozen = drawing.freeze_draw_state(state, self._frame_size)
         if frozen is None:
             return
         bgra, transform = frozen
         self.scene = self.scene.add_layer(Layer(source=ArraySource(bgra), transform=transform))
         if self.interaction is not None:
             self.interaction = InteractionState.initial()
+
+    def _advance_fist_removal(self, gesture_states: list, frame_size: Tuple[int, int]) -> None:
+        """Remove a layer after a fist is held over it for ``FIST_REMOVE_FRAMES`` ticks.
+
+        A hold counter debounces a momentary fist; at the threshold the target is
+        selected + removed via the 'x' key's source-closing path.
+        """
+        target = fist_removal_target(self.scene, gesture_states, frame_size)
+        if target is None:
+            self._fist_index, self._fist_streak = None, 0
+            return
+        self._fist_streak = self._fist_streak + 1 if target == self._fist_index else 1
+        self._fist_index = target
+        if self._fist_streak >= FIST_REMOVE_FRAMES:
+            self.scene = self.scene.select_layer(target)
+            self.scene, self.interaction, self._fit_ids = _remove_selected_layer(
+                self.scene, self.interaction, self._fit_ids
+            )
+            self._fist_index, self._fist_streak = None, 0
 
     def _advance_spawn(self, gesture_states: list, frame_size: Tuple[int, int]) -> bool:
         """Drain the preview inbox, advance the spawn machine, apply any spawn.
@@ -476,55 +487,43 @@ class PipelineRuntime:
                 self.interaction = InteractionState.initial()
         return self._preview_state.is_grabbing
 
-    def clear_stroke(self) -> None:
-        """Discard the in-progress stroke without freezing it (the 'c' key)."""
-        self._stroke = None
-
-    def _stroke_color(self) -> Tuple[int, int, int]:
-        """The current pen color (BGR) for the active palette index."""
-        return drawing.STROKE_PALETTE[self._stroke_color_index]
+    def toggle_draw_mode(self) -> None:
+        """Toggle draw mode; freezes the drawn strokes into a layer on turning off."""
+        if self._draw.mode:
+            self._freeze_draw()  # leaving draw mode banks the drawing
+        else:
+            self._draw = self._draw.with_mode(True)
 
     def _handle_drawing_key(self, key: int) -> None:
-        """Apply the air-drawing keys: clear ('c'), cycle color ('k'), width ('['/']')."""
-        if key == CLEAR_STROKE_KEY:
-            self.clear_stroke()
+        """Apply the drawing keys: toggle mode ('d'), clear ('c'), color ('k'), width."""
+        if key == DRAW_MODE_KEY:
+            self.toggle_draw_mode()
+        elif not self._draw.mode:
+            return  # c/k/[/] only act while in draw mode
+        elif key == CLEAR_STROKE_KEY:
+            self._draw = self._draw.cleared()
         elif key == CYCLE_COLOR_KEY:
-            self._stroke_color_index = drawing.next_color_index(self._stroke_color_index)
+            self._draw = self._draw.with_next_color()
         elif key == STROKE_WIDTH_DOWN_KEY:
-            self._stroke_width = drawing.clamped_width(
-                self._stroke_width - drawing.STROKE_WIDTH_STEP
-            )
+            self._draw = self._draw.with_width_delta(-drawing.STROKE_WIDTH_STEP)
         elif key == STROKE_WIDTH_UP_KEY:
-            self._stroke_width = drawing.clamped_width(
-                self._stroke_width + drawing.STROKE_WIDTH_STEP
-            )
+            self._draw = self._draw.with_width_delta(drawing.STROKE_WIDTH_STEP)
 
     def _composite(self, frame: np.ndarray, tracking: TrackingResult) -> float:
-        """Composite the scene + selection highlight (+ optional skeleton); return ms.
+        """Composite the scene + highlight (+ skeleton/live ink/preview); return ms.
 
-        Empty scene in skeleton mode = a no-op composite; the skeleton + gesture
-        label draws on top when enabled. The docked preview (Phase 15) draws last,
-        after the active stroke and before the HUD, so it shows in the vcam too.
+        The skeleton + gesture label, live draw-mode ink, and the docked preview
+        all draw on top (in that order, before the HUD) so they reach the vcam too.
         """
         with StageTimer() as timer:
             compositor.render(frame, self.scene)
             compositor.draw_selection_highlight(frame, self.scene)
             if self.show_skeleton:
                 _draw_debug(frame, list(tracking.hands), self._primary_gesture(tracking))
-            self._draw_active_stroke(frame)
+            if self._draw.mode:
+                drawing.draw_live_state(frame, self._draw)  # live ink -> preview + vcam
             render_dock(frame, self._preview_state)  # docked preview -> preview + vcam
         return timer.ms
-
-    def _draw_active_stroke(self, frame: np.ndarray) -> None:
-        """Overlay the in-progress stroke + fingertip cursor (after compositing).
-
-        Main-thread drawing on the private composited copy; no-op when no stroke.
-        """
-        if self._stroke is None or self._stroke.is_empty:
-            return
-        drawing.draw_live_stroke(
-            frame, self._stroke.points, self._stroke_color(), self._stroke_width
-        )
 
     def _update_fps(self) -> None:
         """Tick the FPS counter (loop rate) and print/remember a fresh reading."""

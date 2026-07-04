@@ -25,7 +25,7 @@ import sys
 from dataclasses import replace
 from typing import Callable, Iterable, List, Optional, Set, Tuple
 
-from src.interaction import GestureLike, InteractionState
+from src.interaction import InteractionState
 from src.scene import DEFAULT_SCALE, Layer, Scene
 from src.sources import (
     ImageSource,
@@ -309,23 +309,25 @@ def _initial_fit_ids(args: argparse.Namespace, scene: Scene) -> Set[int]:
 
 
 # --------------------------------------------------------------------------- #
-# Gesture precedence (Phase 11): while a hand is air-drawing, its curled-finger
-# pose must not also start a pinch-grab.
+# Fist-to-remove gesture: a closed fist held over a layer removes it. The hold
+# timer lives in the main loop; this just resolves which layer is under a fist.
 # --------------------------------------------------------------------------- #
 
-def suppress_draw_pinch(gesture_states: List[GestureLike]) -> List[GestureLike]:
-    """Force ``is_pinching`` False for any hand currently drawing (``is_draw``).
+def fist_removal_target(
+    scene: Scene, gesture_states: Iterable, frame_size: Tuple[int, int]
+) -> Optional[int]:
+    """Top-most layer index under a hand making a fist (not pinching), or ``None``.
 
-    Deterministic gesture precedence: a draw pose curls the middle/ring/pinky,
-    which can sit near the thumb and false-trigger a pinch rising edge. Feeding
-    the SUPPRESSED states into ``interaction.step`` means a drawing hand never
-    starts (or holds) a grab/resize, while non-drawing hands pass through
-    untouched. Returns a NEW list of new gesture states (``dataclasses.replace``
-    on the frozen ``GestureState``) -- the inputs are never mutated, and the
-    edge memory ``step`` derives from ``is_pinching`` stays coherent, so a real
-    pinch after drawing ends is still a clean rising edge. Pure + unit-testable.
+    The fist-to-remove gesture: a hand closed into a fist (``is_grab``) but NOT
+    pinching -- so a pinch-grab-move (fingers may curl during it) is never
+    mistaken for a fist -- hovering over a layer marks it for removal. Returns
+    the top layer index under the first such hand's palm point (``grab_point``),
+    or ``None`` when no hand is fisting over a layer. Pure: the caller times the
+    hold and performs the removal.
     """
-    return [
-        replace(state, is_pinching=False) if getattr(state, "is_draw", False) else state
-        for state in gesture_states
-    ]
+    for state in gesture_states:
+        if getattr(state, "is_grab", False) and not state.is_pinching:
+            index = scene.top_layer_at(state.grab_point, frame_size)
+            if index is not None:
+                return index
+    return None

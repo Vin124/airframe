@@ -39,15 +39,17 @@ same way; only meaningful when `speech` is also on), `generate` (Phase 16 opt-in
 `min_presence_confidence` / `min_tracking_confidence`
 (startup-only MediaPipe knobs, also `--min-*-confidence` flags).
 
-Runtime keys: `q` quit, `s` toggle skeleton, `r` reset transform, `+/-` scale,
-`v` toggle virtual cam. Image-mode multi-layer: `a`/`w`/`m` add an image / window
-/ screen layer (reusing the launch args), `x` remove the selected layer, `f`
-bring it to the front. A pinch grabs the top-most layer under the pinch point;
-the selected layer is outlined. Image-mode air-drawing (Phase 11): hold the draw
-pose (index extended, other fingers curled) and move your fingertip to draw a
-smoothed stroke; release the pose to freeze it into a grabbable/movable layer.
-`c` clears the in-progress stroke, `k` cycles stroke color, `[` / `]` step the
-stroke width down / up. Spawn gesture (Phase 15, needs `--speech --parse`): when
+Runtime keys: `q` quit, `s` toggle skeleton (ON by default in image mode for
+dev), `r` reset transform, `+/-` scale, `v` toggle virtual cam. Image-mode
+multi-layer: `a`/`w`/`m` add an image / window / screen layer (reusing the launch
+args), `x` remove the selected layer, `f` bring it to the front. A pinch grabs
+the top-most layer under the pinch point; the selected layer is outlined. A
+closed FIST held over a layer for ~0.4s removes it (gesture equivalent of `x`).
+Image-mode air-drawing uses a DRAW MODE (not a held pose): `d` toggles draw mode;
+in it a PINCH is the pen (draws the pinch path while pinching, lifts on release,
+so multiple strokes accumulate), and toggling draw mode off (`d` again) freezes
+the strokes into one grabbable/movable layer. While in draw mode `c` clears the
+in-progress strokes, `k` cycles pen color, `[` / `]` step pen width. Spawn gesture (Phase 15, needs `--speech --parse`): when
 speech->parser->retriever fetches an image it docks as a PREVIEW at the top edge
 of the frame; a pinch that STARTS over the dock and pulls DOWN past a threshold
 instantiates it as a new layer at the pinch point (the existing move/resize then
@@ -73,8 +75,8 @@ src/generator.py       # Image generator (Phase 16, OPTIONAL/GPU, reached via --
 src/spawn.py           # Spawn gesture (Phase 15): PreviewInbox (the ONE speech->main atomic hand-off slot) + pure dock geometry (dock_rect/pinch_over_dock/pull_down_distance/spawn_transform) + the advance_spawn state machine (frozen PreviewState: IDLE docked -> GRABBED -> spawn/dismiss) + suppress_spawn_pinch precedence + render_dock (draws the docked preview onto the composited frame). Pure numpy/cv2 except PreviewInbox; no camera/mediapipe/threads. The main loop is the sole scene writer
 src/timing.py         # pure stage-timer + loop-pacing + EMA-smoothing helpers (Phase 9)
 src/skeleton.py       # draw landmarks + connections (debug overlay)
-src/gestures.py       # pinch/grab/draw detection from landmarks; per-instance enter/exit thresholds (live-tunable); draw-pose N-frame confirmation
-src/drawing.py        # air-drawing (Phase 11): immutable Stroke + smoothing + rasterize-to-BGRA + bbox->Transform placement + live overlay; pure numpy/cv2
+src/gestures.py       # pinch/grab detection from landmarks; per-instance enter/exit thresholds (live-tunable); publishes pinch_point + palm-center grab_point
+src/drawing.py        # air-drawing: DrawState (draw mode + pinch strokes) + smoothing + rasterize-to-BGRA + bbox->Transform placement + live overlay; pure numpy/cv2
 src/tuning.py         # dependency-light GestureTuning + TrackerConfidence snapshots + clamp_tuning (the one hysteresis-gap boundary, shared by panel + config)
 src/window_list.py    # list_window_titles(): open top-level window titles via ctypes EnumWindows (panel dropdown); injectable + failure-safe ([])
 src/hud.py            # heads-up display text + strip (incl. per-stage timing line)
@@ -213,7 +215,7 @@ hand-off, GIL-safe, latest-frame-wins):
   `Scene.add_layer` air-drawing uses) and resets interaction so the held pinch
   cleanly grabs the new layer; an ignored preview dismisses after
   `DISMISS_SECONDS`. Precedence: while GRABBED, `suppress_spawn_pinch` masks the
-  spawning hand's pinch from `interaction.step` (like `suppress_draw_pinch`) so
+  spawning hand's pinch from `interaction.step` so
   dragging the preview can't also grab a scene layer; once spawned, suppression
   stops. `render_dock` draws the docked preview onto the composited copy AFTER the
   compositor + active stroke, BEFORE the HUD, so it shows in BOTH the preview and
@@ -242,16 +244,22 @@ hand-off, GIL-safe, latest-frame-wins):
   id is a module constant. Install the optional torch(CUDA)/diffusers/transformers/
   accelerate/safetensors block from `requirements.txt`.
 - Live window/screen overlays (`--source window|screen`, image mode) use `windows-capture` (Windows Graphics Capture) on their own thread; frames are copied off the reused native buffer (latest-frame-wins, no lock). Monitor index is 1-based (1 = primary). A window that isn't found fails fast; a window closing mid-run leaves the app running (overlay disappears). iPhone/iPad mirroring is not planned.
-- Air-drawing (Phase 11, image mode only): the DRAW-POSE detection + its N-frame
-  confirmation hysteresis live in `GestureDetector` on the TRACKING thread (it
-  publishes `is_draw` + the index-tip `draw_point` on the frozen `GestureState`);
-  the main loop NEVER computes a gesture from raw landmarks. The accumulating
-  `Stroke` is owned by the MAIN loop (single writer of scene/interaction), which
-  appends `draw_point` while `is_draw` holds and, on release, rasterizes it
-  (`src/drawing.py`) into an `ArraySource` layer placed via `bbox_to_transform`
-  so it lands exactly where drawn. Gesture precedence: `layers.suppress_draw_pinch`
-  masks `is_pinching=False` for any drawing hand BEFORE `interaction.step`, so a
-  curled draw pose can't also start a pinch-grab. Keys c/k/[/] are image-mode only.
+- Air-drawing (image mode only) is a DRAW MODE, not a held pose -- an earlier
+  always-on "pointing pose" false-triggered constantly (drew nonstop AND, via the
+  old pinch-suppression, strangled grab/resize). Now `d` toggles `DrawState.mode`
+  (owned by the MAIN loop); in draw mode a PINCH is the pen: the main loop appends
+  the published `pinch_point` while pinching and banks the stroke on release
+  (`_advance_pen`), so interaction/spawn/fist are all inert (a pinch can't also
+  grab). Toggling draw mode off rasterizes all strokes (`drawing.freeze_draw_state`
+  -> `rasterize_strokes`, one BGRA at their combined bbox) into an `ArraySource`
+  layer placed via `bbox_to_transform`. The main loop NEVER computes a gesture
+  from raw landmarks -- it reads only the published pinch. Keys d/c/k/[/] are
+  image-mode only.
+- Fist-to-remove (image mode): `GestureDetector` publishes `is_grab` (fist) + the
+  palm-center `grab_point` (landmark 9). `layers.fist_removal_target` resolves the
+  top layer under a FISTING, NON-pinching hand (so a pinch-grab-move is never
+  mistaken for a fist); the main loop debounces a `FIST_REMOVE_FRAMES` hold, then
+  selects + removes that layer via the same source-closing path as the `x` key.
 - Multiple overlay layers are supported at runtime (Phase 8): add/remove layers,
   pinch to grab whichever is under the pinch point, bring-to-front, all live.
   Selection is single (exactly one active layer); layers carry a stable

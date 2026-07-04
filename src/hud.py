@@ -40,11 +40,12 @@ VIRTUALCAM_OFF = "OFF"
 
 # The key legend is split across HUD lines: the full single-line version
 # overflows the fixed-width strip (cv2.putText neither wraps nor clips). The
-# third line covers the Phase 11 air-drawing keys (image mode).
+# last line covers the draw-mode keys (image mode); a fist over a layer removes
+# it (gesture, no key).
 KEY_LEGEND_LINES = (
     "q quit | s skel | r reset | +/- scale",
-    "v vcam | a/w/m add | f front | x remove",
-    "c clear | k color | [ ] width",
+    "v vcam | a/w/m add | f front | x/fist remove",
+    "d draw | pinch=pen | c clr | k col | [ ] w",
 )
 
 _NO_FPS_TEXT = "--"

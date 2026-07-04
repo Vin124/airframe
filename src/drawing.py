@@ -1,12 +1,12 @@
-"""Air-drawing: the stroke model, smoothing, rasterization, and live overlay.
+"""Air-drawing: the DrawState model, smoothing, rasterization, and live overlay.
 
 Pure and dependency-light (numpy + cv2 only -- no camera, MediaPipe, or
 threads), so every helper here is unit-testable headlessly. The MAIN loop
-(``PipelineRuntime``) owns the accumulating ``Stroke`` -- it is the single
-writer of scene/interaction -- and calls into this module to smooth, render, and
-finally rasterize a released stroke into a BGRA image that becomes a normal
-scene ``Layer``. Points stay normalized 0-1 everywhere; pixel conversion happens
-only at draw/rasterize time, per the project convention.
+(``PipelineRuntime``) owns the ``DrawState`` (draw mode + the pinch-drawn
+strokes) -- it is the single writer of scene/interaction -- and calls into this
+module to smooth, render, and finally rasterize the drawn strokes into one BGRA
+image that becomes a scene ``Layer``. Points stay normalized 0-1 everywhere;
+pixel conversion happens only at draw/rasterize time, per the project convention.
 
 The one non-``numpy``/``cv2`` import is ``scene.Transform`` (itself a pure,
 dependency-light frozen dataclass): ``bbox_to_transform`` maps a rasterized
@@ -16,7 +16,7 @@ testable spot instead of leaking center/scale tuples up to the caller.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 import cv2
@@ -58,37 +58,84 @@ SMOOTHING_WINDOW = 5
 # Radius of the fingertip cursor dot drawn while a stroke is in progress.
 CURSOR_RADIUS_PX = 6
 
-# Air-drawing runtime keys (Phase 11, image mode only): 'c' discards the
-# in-progress stroke, 'k' cycles the stroke color through STROKE_PALETTE, and
-# '['/']' step the stroke width down/up (clamped). Chosen to avoid the keys
-# already bound in main.py (q/s/r/+/-/v/a/w/m/x/f).
+# Air-drawing runtime keys (image mode only). 'd' TOGGLES draw mode (in it a
+# pinch is the pen; toggling off freezes the strokes into a layer). While in
+# draw mode: 'c' discards the in-progress strokes, 'k' cycles the pen color,
+# '['/']' step the pen width. Chosen to avoid the keys already bound in main.py
+# (q/s/r/+/-/v/a/w/m/x/f).
+DRAW_MODE_KEY = ord("d")
 CLEAR_STROKE_KEY = ord("c")
 CYCLE_COLOR_KEY = ord("k")
 STROKE_WIDTH_DOWN_KEY = ord("[")
 STROKE_WIDTH_UP_KEY = ord("]")
 
+Stroke2D = Tuple[Point2D, ...]  # one pen-stroke: an ordered tuple of points
+
 
 @dataclass(frozen=True)
-class Stroke:
-    """An immutable air-drawing stroke: an ordered tuple of normalized points.
+class DrawState:
+    """Immutable air-drawing state for the pinch-to-ink draw mode.
 
-    Functional updates only (``append`` returns a new ``Stroke``), matching the
-    project's immutability rule so the main loop never mutates shared state.
+    ``mode`` is the draw-mode toggle (off by default -- hands grab/move normally
+    and the pen is inert). While in draw mode a pinch is the pen: ``current`` is
+    the stroke being drawn (pen down), ``segments`` are the finished strokes
+    (pen lifted between them). Toggling draw mode off freezes ``segments`` +
+    ``current`` into ONE layer (see ``freeze_draw_state``). ``color_index`` /
+    ``width`` are the live pen settings driven by the k/[/] keys. All transitions
+    return a NEW instance (functional updates) so the main loop -- the single
+    writer -- never mutates shared state.
     """
 
-    points: Tuple[Point2D, ...] = ()
+    mode: bool = False
+    segments: Tuple[Stroke2D, ...] = ()
+    current: Stroke2D = ()
+    color_index: int = 0
+    width: int = DEFAULT_STROKE_WIDTH
 
-    def append(self, point: Point2D) -> "Stroke":
-        """Return a new stroke with ``point`` added to the end."""
-        return Stroke(points=self.points + ((float(point[0]), float(point[1])),))
+    def with_mode(self, mode: bool) -> "DrawState":
+        """Set draw mode on/off (freezing on 'off' is the caller's job)."""
+        return replace(self, mode=mode)
+
+    def pen_move(self, point: Point2D) -> "DrawState":
+        """Extend the in-progress stroke with ``point`` (pen down this frame)."""
+        return replace(self, current=self.current + ((float(point[0]), float(point[1])),))
+
+    def pen_up(self) -> "DrawState":
+        """Lift the pen: bank the in-progress stroke (if real) and start fresh.
+
+        A stroke shorter than ``MIN_STROKE_POINTS`` (a tap, not a line) is
+        discarded rather than banked.
+        """
+        if len(self.current) >= MIN_STROKE_POINTS:
+            return replace(self, segments=self.segments + (self.current,), current=())
+        return replace(self, current=())
+
+    def cleared(self) -> "DrawState":
+        """Discard all in-progress strokes without freezing (the 'c' key)."""
+        return replace(self, segments=(), current=())
+
+    def with_next_color(self) -> "DrawState":
+        """Advance the pen color to the next palette entry (the 'k' key)."""
+        return replace(self, color_index=next_color_index(self.color_index))
+
+    def with_width_delta(self, delta: int) -> "DrawState":
+        """Step the pen width by ``delta``, clamped (the '['/']' keys)."""
+        return replace(self, width=clamped_width(self.width + delta))
+
+    @property
+    def color(self) -> Tuple[int, int, int]:
+        """The current pen color (BGR)."""
+        return STROKE_PALETTE[self.color_index]
+
+    @property
+    def all_strokes(self) -> Tuple[Stroke2D, ...]:
+        """Finished segments plus the in-progress stroke (for overlay/freeze)."""
+        return self.segments + (self.current,) if self.current else self.segments
 
     @property
     def is_empty(self) -> bool:
-        """True when the stroke has no points yet."""
-        return len(self.points) == 0
-
-    def __len__(self) -> int:
-        return len(self.points)
+        """True when nothing has been drawn yet (no segments, no current)."""
+        return not self.segments and not self.current
 
 
 def smooth_points(
@@ -206,38 +253,90 @@ def bbox_to_transform(
     return Transform(center_x, center_y, DEFAULT_SCALE)
 
 
-def freeze_stroke(
-    points: Tuple[Point2D, ...],
+def rasterize_strokes(
+    strokes: Tuple[Stroke2D, ...],
     frame_size: Size,
     color: Tuple[int, int, int],
     width: int,
-) -> Optional[Tuple[np.ndarray, Transform]]:
-    """Turn a released stroke into its frozen-layer ingredients, or ``None``.
+    padding: int = RASTER_PADDING_PX,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Render one or more strokes into a single BGRA image + its frame bbox.
 
-    The pure half of freezing: smooth the path, rasterize it to a BGRA image at
-    its bounding box, and map that box to the placement ``Transform`` that puts
-    the layer exactly where the stroke was drawn. Returns ``None`` for a stroke
-    with fewer than ``MIN_STROKE_POINTS`` points (a tap isn't a drawing). The
-    caller wraps the image in a source and adds the scene layer.
+    The multi-stroke sibling of ``rasterize_stroke``: every stroke is drawn into
+    one canvas cropped to their COMBINED bounding box, so a drawing made of
+    several pen strokes becomes one layer. Returns ``None`` when there are no
+    points to draw. Each stroke renders as a dot (1 point) or an antialiased
+    polyline; alpha follows the drawn pixels.
     """
-    if len(points) < MIN_STROKE_POINTS:
+    pixel_strokes = [
+        _to_pixels(stroke, frame_size) for stroke in strokes if stroke
+    ]
+    if not pixel_strokes:
         return None
-    smoothed = smooth_points(points)
-    bgra, bbox = rasterize_stroke(smoothed, frame_size, color, width)
+    xs = [px for stroke in pixel_strokes for px, _ in stroke]
+    ys = [py for stroke in pixel_strokes for _, py in stroke]
+    margin = padding + (width + 1) // 2
+    x0 = int(math.floor(min(xs))) - margin
+    y0 = int(math.floor(min(ys))) - margin
+    x1 = int(math.ceil(max(xs))) + margin
+    y1 = int(math.ceil(max(ys))) + margin
+    img_w = max(1, x1 - x0)
+    img_h = max(1, y1 - y0)
+
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    for stroke in pixel_strokes:
+        local = np.array(
+            [[int(round(px - x0)), int(round(py - y0))] for px, py in stroke],
+            dtype=np.int32,
+        )
+        if len(local) == 1:
+            cv2.circle(mask, tuple(local[0]), max(1, width // 2), 255, -1, cv2.LINE_AA)
+        else:
+            cv2.polylines(mask, [local], False, 255, int(width), cv2.LINE_AA)
+
+    bgra = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+    drawn = mask > 0
+    for channel in range(3):
+        bgra[drawn, channel] = color[channel]
+    bgra[:, :, 3] = mask
+    return bgra, (x0, y0, img_w, img_h)
+
+
+def freeze_draw_state(
+    state: DrawState, frame_size: Size
+) -> Optional[Tuple[np.ndarray, Transform]]:
+    """Turn a finished ``DrawState`` into its frozen-layer ingredients, or ``None``.
+
+    Smooths every real stroke (segments + a long-enough current one), rasterizes
+    them into one BGRA image at their combined bounding box, and maps that box to
+    the placement ``Transform`` that puts the layer exactly where it was drawn.
+    Returns ``None`` when nothing worth freezing was drawn.
+    """
+    strokes = tuple(
+        smooth_points(stroke)
+        for stroke in state.all_strokes
+        if len(stroke) >= MIN_STROKE_POINTS
+    )
+    if not strokes:
+        return None
+    result = rasterize_strokes(strokes, frame_size, state.color, state.width)
+    if result is None:
+        return None
+    bgra, bbox = result
     return bgra, bbox_to_transform(bbox, frame_size)
 
 
-def draw_live_stroke(
-    frame: np.ndarray,
-    points: Tuple[Point2D, ...],
-    color: Tuple[int, int, int],
-    width: int,
-) -> None:
-    """Draw the in-progress stroke (smoothed) + its fingertip cursor in place."""
-    smoothed = smooth_points(points)
-    draw_stroke_overlay(frame, smoothed, color, width)
-    if smoothed:
-        draw_cursor(frame, smoothed[-1], color)
+def draw_live_state(frame: np.ndarray, state: DrawState) -> None:
+    """Overlay the in-progress drawing (all strokes smoothed) + a pen cursor.
+
+    Main-thread drawing on the private composited copy while draw mode is active,
+    so the strokes-so-far and the pen tip show live before the layer is frozen.
+    A no-op when nothing has been drawn.
+    """
+    for stroke in state.all_strokes:
+        draw_stroke_overlay(frame, smooth_points(stroke), state.color, state.width)
+    if state.current:
+        draw_cursor(frame, state.current[-1], state.color)
 
 
 def draw_stroke_overlay(
