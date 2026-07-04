@@ -50,9 +50,9 @@ LIVE_SOURCES = (SOURCE_WINDOW, SOURCE_SCREEN)
 # windows-capture indexes monitors 1-based (1 = primary); index 0 is rejected.
 DEFAULT_MONITOR_INDEX = 1
 
-# A captured window/monitor is usually far larger than the 640x480 webcam frame;
-# at scale 1.0 it would bury the feed. On the first frame its size is known, fit
-# its width to this fraction of the frame so the webcam stays visible.
+# A captured window/monitor can be as large as (or larger than) the webcam
+# frame; at scale 1.0 it would bury the feed. On the first frame its size is
+# known, fit its width to this fraction of the frame so the webcam stays visible.
 INITIAL_FIT_FRACTION = 0.5
 
 # Image-mode multi-layer keys (Phase 8). 'a'/'w'/'m' add an image / window /

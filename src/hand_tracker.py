@@ -33,6 +33,15 @@ LANDMARKS_PER_HAND = 21
 # Default to a single hand — enough for the MVP (see CLAUDE.md).
 DEFAULT_NUM_HANDS = 1
 
+# Detection input cap: frames taller than this are downscaled (aspect kept)
+# before entering MediaPipe. The camera now captures at NATIVE resolution
+# (e.g. 1080p) for a crisp preview/virtual cam, but MediaPipe's models resize
+# their input to ~200px internally anyway -- feeding it the full frame only
+# inflates the per-detect BGR->RGB conversion and copy cost. 480 matches the
+# height the tracker ran at before native capture, so detect cost and accuracy
+# stay as tuned. Landmarks are normalized [0, 1], so callers see no difference.
+DETECTION_MAX_HEIGHT = 480
+
 # Official float16 hand-landmarker bundle.
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -95,6 +104,23 @@ def ensure_model(
     return model_path
 
 
+def downscale_for_detection(frame_bgr, max_height: int = DETECTION_MAX_HEIGHT):
+    """Return ``frame_bgr`` downscaled so its height is at most ``max_height``.
+
+    Aspect ratio is preserved; a frame already within the cap is returned
+    as-is (no copy). Pure function of its inputs, so it's unit-testable
+    without MediaPipe.
+    """
+    height, width = frame_bgr.shape[:2]
+    if height <= max_height:
+        return frame_bgr
+    scale = max_height / height
+    new_width = max(1, round(width * scale))
+    return cv2.resize(
+        frame_bgr, (new_width, max_height), interpolation=cv2.INTER_AREA
+    )
+
+
 def landmarks_to_hands(hand_landmarks_list) -> List[Hand]:
     """Convert a MediaPipe result's ``hand_landmarks`` into plain tuples.
 
@@ -153,7 +179,7 @@ def create_landmarker(
 
     Chunk 3 deferral: this flag only requests MediaPipe's built-in GPU delegate.
     A full ONNX Runtime / TensorRT port of the hand model is intentionally NOT
-    attempted here (see spec.md's out-of-scope notes).
+    attempted here (see docs/spec.md's out-of-scope notes).
     """
     if gpu:
         try:
@@ -218,8 +244,11 @@ class HandTracker:
         """Detect hands in a BGR frame.
 
         Returns a list of hands (each 21 normalized ``(x, y, z)`` tuples), or an
-        empty list if no hand is found.
+        empty list if no hand is found. Oversized frames (native-resolution
+        capture) are downscaled to ``DETECTION_MAX_HEIGHT`` first; the
+        normalized landmarks are unaffected.
         """
+        frame_bgr = downscale_for_detection(frame_bgr)
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self._landmarker.detect_for_video(mp_image, self._next_timestamp_ms())

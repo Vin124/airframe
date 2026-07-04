@@ -9,13 +9,16 @@ file / a stubbed urlopen.
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
 from src.hand_tracker import (
+    DETECTION_MAX_HEIGHT,
     HandTrackerError,
     LANDMARKS_PER_HAND,
     create_landmarker,
+    downscale_for_detection,
     ensure_model,
     landmarks_to_hands,
 )
@@ -46,6 +49,24 @@ def _factory(record, *, fail_gpu=False, fail_all=False):
         return delegate  # stand-in "landmarker" tagged with the delegate it used
 
     return factory
+
+
+def test_downscale_leaves_small_frames_untouched():
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert downscale_for_detection(frame) is frame  # no copy, same object
+
+
+def test_downscale_caps_height_and_keeps_aspect():
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    small = downscale_for_detection(frame)
+    assert small.shape[0] == DETECTION_MAX_HEIGHT
+    assert small.shape[1] == round(1920 * DETECTION_MAX_HEIGHT / 1080)  # 853
+
+
+def test_downscale_honors_custom_cap():
+    frame = np.zeros((1000, 500, 3), dtype=np.uint8)
+    small = downscale_for_detection(frame, max_height=100)
+    assert small.shape[:2] == (100, 50)
 
 
 def test_landmarks_to_hands_empty_when_no_hands():

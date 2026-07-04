@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from src.sinks import PreviewSink, Sink
+from src.sinks.preview import initial_window_size
 from src.sources import ImageSource, Source, SourceError, WebcamSource
 from src.sources.image import ensure_bgra
 from src.sources.webcam import WebcamSource as WebcamSourceDirect
@@ -170,3 +171,22 @@ def test_preview_sink_is_a_sink_with_window_name():
 
 def test_preview_sink_default_window_name():
     assert PreviewSink().window_name == "handy"
+
+
+def test_initial_window_size_keeps_small_frames_as_is():
+    # A frame within the cap is never upscaled.
+    assert initial_window_size(640, 480) == (640, 480)
+
+
+def test_initial_window_size_scales_1080p_down_keeping_aspect():
+    width, height = initial_window_size(1920, 1080)
+    assert (width, height) == (1280, 720)
+
+
+def test_initial_window_size_caps_by_the_tighter_dimension():
+    # Tall 4:3 frame: height is the binding constraint (720), width follows.
+    assert initial_window_size(1600, 1200) == (960, 720)
+
+
+def test_initial_window_size_honors_custom_caps():
+    assert initial_window_size(1000, 1000, max_width=100, max_height=50) == (50, 50)
