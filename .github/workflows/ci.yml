@@ -5,12 +5,18 @@ on:
     branches: [master]
   pull_request:
 
+# A newer push supersedes any still-running build of the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     # The project targets Windows (Windows Graphics Capture, ctypes
     # EnumWindows, OBS virtual cam), so tests run on a Windows runner. The
     # suite itself is headless: no webcam, display, mic, or network needed.
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
