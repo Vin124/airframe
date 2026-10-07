@@ -571,13 +571,13 @@ def test_wikimedia_fetch_assembles_asset(monkeypatch):
     )
     monkeypatch.setattr("src.retriever._fetch_json", lambda *a, **k: payload)
     monkeypatch.setattr("src.retriever._download_bytes", lambda *a, **k: _png_bytes(10, 12))
-    monkeypatch.setattr("src.retriever._save_to_cache", lambda *a, **k: "/tmp/shacam_cache/x.img")
+    monkeypatch.setattr("src.retriever._save_to_cache", lambda *a, **k: "/tmp/airframe_cache/x.img")
 
     asset = WikimediaSource().fetch("CFTR")
     assert asset is not None
     assert asset.source_name == "wikimedia"
     assert asset.bgra.shape == (10, 12, 4)
-    assert asset.cache_path == "/tmp/shacam_cache/x.img"
+    assert asset.cache_path == "/tmp/airframe_cache/x.img"
     assert "CC0" in asset.attribution
 
 

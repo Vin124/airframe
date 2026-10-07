@@ -11,7 +11,7 @@ models/
 *.task.part
 
 # Per-user local state
-handy_config.json
+airframe_config.json
 
 # Editors
 .vscode/

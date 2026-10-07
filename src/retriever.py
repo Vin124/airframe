@@ -79,7 +79,7 @@ MAX_DECODE_PIXELS = 40_000_000
 # Max HTTP redirects followed; each hop is re-validated (see the redirect handler).
 MAX_REDIRECTS = 5
 # Wikimedia requires a descriptive User-Agent on API + upload requests.
-USER_AGENT = "shacam-win/0.1 (hand-tracking debug harness)"
+USER_AGENT = "airframe/0.1 (hand-tracking debug harness)"
 
 # Wikimedia Commons MediaWiki API endpoint.
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
@@ -92,7 +92,7 @@ _PREFERRED_MIMES = ("image/jpeg", "image/png")
 _ALLOWED_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 
 # Temp cache directory name (under the OS temp dir) for downloaded originals.
-CACHE_DIR_NAME = "shacam_cache"
+CACHE_DIR_NAME = "airframe_cache"
 # Image file extensions the local library will consider.
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 # Attribution strings are bounded so a hostile extmetadata blob stays small.

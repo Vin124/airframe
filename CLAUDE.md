@@ -26,7 +26,7 @@ live FPS readout. The window-title dropdown re-enumerates open top-level windows
 each time it opens (`src/window_list.py`, ctypes `EnumWindows`, no new dep) and
 stays editable so a custom substring still works. Its buttons/sliders drive the
 same runtime the hotkeys use. Pass `--no-panel` to run hotkey-only. Last-used
-panel settings persist to `handy_config.json` (repo root, git-ignored) on exit
+panel settings persist to `airframe_config.json` (repo root, git-ignored) on exit
 and pre-fill on start; precedence is **CLI > config > defaults**.
 
 Persisted config keys: `source`, `image_path`, `window_title`, `monitor_index`,
@@ -86,7 +86,7 @@ src/window_list.py    # list_window_titles(): open top-level window titles via c
 src/hud.py            # heads-up display text + strip (incl. per-stage timing line)
 src/fps.py            # frame-rate counter (loop rate)
 src/panel.py          # Tkinter control panel + PanelActions controller (Phase 10); pumped by PipelineRuntime
-src/config.py         # pure load/save/merge of the panel's last settings (handy_config.json)
+src/config.py         # pure load/save/merge of the panel's last settings (airframe_config.json)
 src/sources/          # frame producers (Source contract) -> latest frame as numpy array
     base.py           #   Source ABC + SourceError
     webcam.py         #   WebcamSource: live feed, applies the selfie mirror (blocking read)
@@ -160,7 +160,7 @@ hand-off, GIL-safe, latest-frame-wins):
   never reintroduce pinch-label flicker. The thresholds are palm-relative
   RATIOS (thumb-index distance / wrist-to-middle-MCP palm length, range
   0.10-0.90, defaults 0.30/0.45), NOT fractions of the frame — the old
-  frame-fraction values (0.01-0.15) persisted in a stale `handy_config.json`
+  frame-fraction values (0.01-0.15) persisted in a stale `airframe_config.json`
   fall below the ratio range and auto-reset to the defaults on load.
 - Hand-slot stability: MediaPipe returns hands in no guaranteed order, so with
   two hands in frame a hand could swap detector slots mid-gesture (taking the
@@ -224,7 +224,7 @@ hand-off, GIL-safe, latest-frame-wins):
   validated for this debug harness: http/https scheme only (`is_allowed_url`
   rejects file/ftp/data), a 20 MB download cap, a 10 s timeout, and a 1024 px max
   dimension (downscaled; also requested server-side via `iiurlwidth`). Downloads
-  land in `<tempdir>/shacam_cache`; the decoded BGRA is the in-hand asset.
+  land in `<tempdir>/airframe_cache`; the decoded BGRA is the in-hand asset.
   `Retriever.retrieve` NEVER raises (degrade-never-die): a no-result/network
   error returns `None` + a notice. It runs ON THE SPEECH thread (blocking network
   is fine there, NEVER on the render loop) and hands its asset to Phase 15 via the

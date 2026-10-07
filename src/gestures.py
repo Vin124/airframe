@@ -57,7 +57,7 @@ _MIN_CURLED_FINGERS_FOR_GRAB = 3
 #     snapshot to the tracking thread, which swaps the thresholds onto the
 #     detectors it owns (see ``GestureDetector.set_thresholds`` +
 #     ``src.tracking.TrackingWorker.set_tuning``). The slider values persist to
-#     ``handy_config.json`` (keys ``pinch_enter`` / ``pinch_exit``) and pre-fill
+#     ``airframe_config.json`` (keys ``pinch_enter`` / ``pinch_exit``) and pre-fill
 #     the sliders next launch. Use the sliders to dial these in interactively.
 #   - The two numbers below are only the built-in DEFAULTS (re-exported from
 #     ``src.tuning``) used before any slider move / persisted config. Guidance:

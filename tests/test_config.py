@@ -132,14 +132,14 @@ def test_load_missing_file_returns_defaults(tmp_path):
 
 
 def test_load_corrupt_file_returns_defaults_with_notice(tmp_path, capsys):
-    bad = tmp_path / "handy_config.json"
+    bad = tmp_path / "airframe_config.json"
     bad.write_text("{ this is not json", encoding="utf-8")
     assert config.load_config(bad) == config.default_config()
     assert "config" in capsys.readouterr().err.lower()
 
 
 def test_save_then_load_roundtrips(tmp_path):
-    path = tmp_path / "handy_config.json"
+    path = tmp_path / "airframe_config.json"
     settings = {
         "source": "screen",
         "image_path": "x.png",
@@ -217,7 +217,7 @@ def test_merge_rejects_bool_confidence():
 
 
 def test_save_merges_incomplete_dict(tmp_path):
-    path = tmp_path / "handy_config.json"
+    path = tmp_path / "airframe_config.json"
     config.save_config(path, {"source": "window"})  # partial
     written = json.loads(path.read_text(encoding="utf-8"))
     # Missing keys are filled from defaults on the way out.
@@ -227,7 +227,7 @@ def test_save_merges_incomplete_dict(tmp_path):
 
 
 def test_save_drops_invalid_values(tmp_path):
-    path = tmp_path / "handy_config.json"
+    path = tmp_path / "airframe_config.json"
     config.save_config(path, {"source": "bogus", "monitor_index": 0})
     written = json.loads(path.read_text(encoding="utf-8"))
     assert written["source"] == "image"

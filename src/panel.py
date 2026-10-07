@@ -130,7 +130,7 @@ class ControlPanel:
         except tk.TclError as exc:  # pragma: no cover - needs a headless box
             raise PanelUnavailable(str(exc)) from exc
 
-        self._root.title("handy control")
+        self._root.title("Airframe control")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._source_var = tk.StringVar(value=prefill.get("source", SOURCE_IMAGE))

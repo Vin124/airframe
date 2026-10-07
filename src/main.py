@@ -111,7 +111,7 @@ from src.trash import draw_trash_zone, in_trash_zone
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids Tk import at runtime
     from src.panel import ControlPanel
 
-WINDOW_NAME = "handy"
+WINDOW_NAME = "Airframe"
 QUIT_KEY = "q"
 
 # Main-loop display target. Capture and hand tracking run on their own threads at
@@ -720,7 +720,7 @@ def run(args: argparse.Namespace) -> None:
     paced to ``TARGET_FPS`` (see ``PipelineRuntime`` / ``TrackingWorker`` /
     ``ThreadedSource``). The webcam opens synchronously first (fail-fast) before
     its thread starts. Unless ``--no-panel``, a Tk panel is created on this thread
-    and pumped per tick. Settings load from ``handy_config.json`` (CLI > config >
+    and pumped per tick. Settings load from ``airframe_config.json`` (CLI > config >
     defaults) and persist back on exit.
     """
     cfg = config.load_config(config.CONFIG_FILENAME)

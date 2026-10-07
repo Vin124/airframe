@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 ## Project
-**shacam-win** — early MVP of a webcam hand-tracking tool (Shacam-style), for Windows, built to run on a laptop webcam.
+**airframe** — early MVP of a webcam hand-tracking tool (Shacam-style), for Windows, built to run on a laptop webcam.
 
 This repo is **not** the production app. It's a debug harness to prove out real-time hand tracking and gesture-driven image manipulation before any of the heavy production pieces (virtual camera driver, DirectX compositing) get built.
 
@@ -45,7 +45,7 @@ As of Phase 9 the pipeline stages run on separate threads (see "Threading model"
 below): the webcam capture and the hand tracking each get their own thread, and
 the main loop only composites + displays, paced to a target FPS.
 ```
-shacam-win/
+airframe/
 ├── CLAUDE.md
 ├── plan.md
 ├── plan-2.md               # Chunk 2 phases (5-10)
@@ -67,7 +67,7 @@ shacam-win/
     ├── hud.py              # heads-up display text + strip (incl. per-stage timing line)
     ├── fps.py              # frame-rate counter (main-loop rate)
     ├── panel.py            # Tkinter control panel + PanelActions controller (Phase 10)
-    ├── config.py           # pure load/save/merge of the panel's last settings (handy_config.json)
+    ├── config.py           # pure load/save/merge of the panel's last settings (airframe_config.json)
     ├── sources/            # frame producers (Source contract) -> latest frame as numpy array
     │   ├── base.py         #   Source ABC + SourceError
     │   ├── webcam.py       #   WebcamSource: live feed, applies the selfie mirror (blocking read)
@@ -147,7 +147,7 @@ single writer of scene/interaction). Pass `--no-panel` to run hotkey-only
 
 The last source choice, image path, window title, monitor index, virtual-cam
 state, pinch thresholds (`pinch_enter` / `pinch_exit`), and the three MediaPipe
-min-confidence knobs persist to `handy_config.json` (repo root, git-ignored) on
+min-confidence knobs persist to `airframe_config.json` (repo root, git-ignored) on
 exit and pre-fill the panel/tracker on start. Startup precedence is **CLI flags >
 config > built-in defaults**; a missing or corrupt config falls back to defaults
 with a stderr notice, never a crash. See `src/config.py` (pure load/save/merge)

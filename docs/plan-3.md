@@ -1,4 +1,4 @@
-# plan-3.md — shacam-win, Chunk 3 (speak-and-gesture AR presenter)
+# plan-3.md — airframe, Chunk 3 (speak-and-gesture AR presenter)
 
 Continues from `plan-2.md` (Chunk 2 done: pipeline refactor, virtual cam, window/screen capture, multi-layer scene). This chunk adds the "conjure things into frame" layer — draw shapes in the air, and speak to pull real images into the call.
 

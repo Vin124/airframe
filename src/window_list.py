@@ -11,8 +11,8 @@ must never crash the control panel.
 from typing import Callable, Iterable, List
 
 # The app's own windows, hidden from the picker (matched case-insensitively):
-# the OpenCV preview ("handy") and the Tk control panel ("handy control").
-_OWN_TITLES = frozenset({"handy", "handy control"})
+# the OpenCV preview ("Airframe") and the Tk control panel ("Airframe control").
+_OWN_TITLES = frozenset({"airframe", "airframe control"})
 
 
 def _win32_titles() -> List[str]:

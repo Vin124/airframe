@@ -1,7 +1,7 @@
-# progress.md — shacam-win build log
+# progress.md — airframe build log
 
 Chunk 1 (`plan.md`, Phases 0-4): built 2026-07-02. Chunk 2 (`plan-2.md`, Phases 5-10): built 2026-07-03 — see the second half of this file.
-Repo: https://github.com/Vin124/handy (private).
+Repo: https://github.com/Vin124/airframe (private).
 
 ## How to run
 
@@ -72,7 +72,7 @@ Keys: `q` quit · `s` skeleton overlay · `r` reset transform · `+/-` scale · 
 · `a`/`w`/`m` add image/window/screen layer · `x` remove selected · `f` bring to front.
 A Tkinter control panel (on by default) mirrors all of it: source picker + file browser,
 add layer, virtual-cam checkbox, reset scene, live FPS. Last settings persist to
-`handy_config.json` (gitignored; precedence CLI > config > defaults).
+`airframe_config.json` (gitignored; precedence CLI > config > defaults).
 
 ## Phase-by-phase
 
@@ -83,7 +83,7 @@ add layer, virtual-cam checkbox, reset scene, live FPS. Last settings persist to
 | 7 — Window/screen capture | `3c8b15f` | WindowSource + MonitorSource (windows-capture, own callback thread, latest-frame-wins, graceful window-death), --source/--window-title/--monitor-index, one-time fit to half frame | 197 |
 | 8 — Multi-layer scene | `82ee3e7` | pinch selects top-most layer under the point (rising-edge only, no mid-gesture stealing), stable layer_ids, add/remove/raise keys, selection highlight, per-layer pending fit | 245 |
 | 9 — Performance pass | `1625e3e` | capture thread + tracking thread (owns MediaPipe timestamps + gesture hysteresis) + 30fps-paced main loop; per-stage EMA timings on HUD; --gpu best-effort w/ CPU fallback; 10.5 → ~29.5 FPS | 295 |
-| 10 — Control panel + config | `0345b6d` | Tkinter panel (main-thread pump, zero logic duplication — drives the same runtime methods as hotkeys), handy_config.json persistence, --no-panel | 332 |
+| 10 — Control panel + config | `0345b6d` | Tkinter panel (main-thread pump, zero logic duplication — drives the same runtime methods as hotkeys), airframe_config.json persistence, --no-panel | 332 |
 | cleanup | `822da68` | dead-code sweep (vulture); main.py 1006 → 699 lines by extracting layers.py (scene/source transitions + vocabulary constants) and launch.py (config/panel bridge) | 332 |
 
 Every phase: implemented → full pytest suite green → opus code review (all CRITICAL/HIGH
@@ -104,7 +104,7 @@ them) → committed.
   → single notice, app keeps running; missing window → clean exit 1 with actionable
   message; OBS Virtual Camera backend detected and fed (Phase 6); --gpu prints fallback
   notice and runs CPU; panel opens, pre-fills from config, syncs the 'v' key, writes
-  handy_config.json on clean quit.
+  airframe_config.json on clean quit.
 - **Not yet human-verified:** selecting the "OBS Virtual Camera" in an actual Zoom/Teams/
   Meet call (backend init + frame streaming is verified; the picker UX needs your eyes);
   gesture feel with multiple overlapping layers; panel ergonomics.
@@ -135,7 +135,7 @@ them) → committed.
   is future polish).
 - Panel modal dialogs (file Browse) pause the render loop while open (documented; capture
   threads keep running).
-- handy_config.json is CWD-relative and written non-atomically (self-heals on corrupt read).
+- airframe_config.json is CWD-relative and written non-atomically (self-heals on corrupt read).
 - A CLI value equal to its built-in default can't override a remembered config value
   (argparse limitation, documented in launch.py).
 - Hand slots can still swap between frames in two-hand tracking (chunk-1 note, unchanged).
@@ -171,7 +171,7 @@ New runtime keys (image mode): air-drawing — hold the draw pose (index extende
 fingers curled) to trace a stroke; release to freeze it into a grabbable layer. `c` clear
 in-progress stroke, `k` cycle stroke color, `[`/`]` stroke width. Speak "insert CFTR" (with
 `--speech --parse`) to dock a fetched image at the top edge; pinch it and pull down to spawn
-it into the scene. `--speech`/`--parse`/`--generate` persist to `handy_config.json` like the
+it into the scene. `--speech`/`--parse`/`--generate` persist to `airframe_config.json` like the
 other flags (CLI > config > default).
 
 ## Phase-by-phase

@@ -1,4 +1,4 @@
-# plan.md — shacam-win MVP
+# plan.md — airframe MVP
 
 Build order is strict: each phase must run before starting the next. Copy the **Prompt for Claude Code** block into Claude Code for each phase.
 

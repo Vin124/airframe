@@ -41,7 +41,7 @@ from src.tuning import (
 
 # Written to the current working directory (the repo root when launched via
 # ``python -m src.main``). Git-ignored -- it's per-user local state.
-CONFIG_FILENAME = "handy_config.json"
+CONFIG_FILENAME = "airframe_config.json"
 
 # Serialization values for the source choice. These intentionally mirror
 # ``src.main``'s ``SOURCE_*`` CLI choices (same literals) but are declared here

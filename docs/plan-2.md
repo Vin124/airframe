@@ -1,4 +1,4 @@
-# plan-2.md — shacam-win, Chunk 2 (POC → usable app)
+# plan-2.md — airframe, Chunk 2 (POC → usable app)
 
 Continues from `plan.md` (Phases 0–4 done: skeleton + image modes working). This chunk turns the demo into an app you can select as a camera in Zoom/Teams/Meet, overlaying live app windows you manipulate by hand.
 

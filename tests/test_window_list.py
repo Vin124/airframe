@@ -15,7 +15,7 @@ def test_filters_empty_and_whitespace_titles():
 
 def test_excludes_the_apps_own_windows_case_insensitively():
     titles = list_window_titles(
-        lambda: ["handy", "HANDY CONTROL", "Handy Control", "Notepad"]
+        lambda: ["airframe", "AIRFRAME CONTROL", "Airframe Control", "Notepad"]
     )
     assert titles == ["Notepad"]  # every casing of the own titles dropped
 

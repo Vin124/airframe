@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/banner.png" alt="handy" width="620" />
+  <img src="assets/banner.png" alt="Airframe" width="760" />
 </p>
 
 <p align="center">
-  <a href="https://github.com/Vin124/handy/actions/workflows/ci.yml"><img src="https://github.com/Vin124/handy/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/Vin124/airframe/actions/workflows/ci.yml"><img src="https://github.com/Vin124/airframe/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+" /></a>
   <a href="#requirements"><img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4.svg" alt="Platform: Windows" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
@@ -81,8 +81,8 @@ and the rest of the app keeps running.
 ## Quick start
 
 ```bash
-git clone https://github.com/Vin124/handy.git
-cd handy
+git clone https://github.com/Vin124/airframe.git
+cd airframe
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -150,7 +150,7 @@ python -m src.main --mode image --image assets/test.png --speech --parse --gener
 A small Tkinter panel opens alongside the preview (skip with `--no-panel`):
 pick a source and add it as a layer, toggle the virtual camera, reset the
 scene, retune pinch detection with two live sliders, and watch the FPS
-readout. Last-used settings persist to `handy_config.json` and pre-fill next
+readout. Last-used settings persist to `airframe_config.json` and pre-fill next
 launch (**CLI flags > saved config > defaults**).
 
 ## How it works
@@ -198,7 +198,7 @@ Architecture notes for AI-assisted development live in [`CLAUDE.md`](CLAUDE.md).
   to CPU with a notice (the expected case on Windows Python wheels).
 - **Smoothing** — retune `DEFAULT_MIN_CUTOFF` / `DEFAULT_BETA` in
   `src/smoothing.py` if tracking feels sticky or floaty.
-- All persisted settings live in `handy_config.json` (created on exit,
+- All persisted settings live in `airframe_config.json` (created on exit,
   git-ignored).
 
 ## Troubleshooting
@@ -223,7 +223,7 @@ for exploring webcam hand-tracking, not a polished app.
   grace that rides out brief tracking dropouts) but **may still not work well
   for you.**
 - If grabbing misbehaves, open the control panel and adjust the **pinch ENTER /
-  EXIT** sliders live; settings persist to `handy_config.json`.
+  EXIT** sliders live; settings persist to `airframe_config.json`.
 - Feedback and issues are welcome while this is being figured out.
 
 ## Development

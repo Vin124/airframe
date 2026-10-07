@@ -170,7 +170,7 @@ def test_preview_sink_is_a_sink_with_window_name():
 
 
 def test_preview_sink_default_window_name():
-    assert PreviewSink().window_name == "handy"
+    assert PreviewSink().window_name == "Airframe"
 
 
 def test_initial_window_size_keeps_small_frames_as_is():

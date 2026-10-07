@@ -1,12 +1,12 @@
-# Contributing to handy
+# Contributing to Airframe
 
 Thanks for your interest! Issues and pull requests are welcome.
 
 ## Dev setup
 
 ```bash
-git clone https://github.com/Vin124/handy.git
-cd handy
+git clone https://github.com/Vin124/airframe.git
+cd airframe
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt

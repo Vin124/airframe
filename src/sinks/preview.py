@@ -13,7 +13,7 @@ import numpy as np
 
 from src.sinks.base import Sink
 
-DEFAULT_WINDOW_NAME = "handy"
+DEFAULT_WINDOW_NAME = "Airframe"
 
 # Initial preview WINDOW cap (the frame itself stays full resolution). With
 # native-resolution capture a 1080p+ autosized window would overflow a laptop
